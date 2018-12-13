@@ -55,13 +55,12 @@ int main(int argc, char* argv[])
     int plane;
     MPI_Comm_rank(dup_comm, &plane);
     
-    double *M, *NT, *P;
-    if (0 == my_rank) initial_matrix(&M, &NT, &P, n, n, n);
+    double *M, *N, *P;
+    if (0 == my_rank) initial_matrix(&M, &N, &P, n, n, n);
 
     double *A  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *BT = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *B  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *C  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *C0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
 
     //Scatter and Gather used data types
     MPI_Datatype subarrtype;
@@ -71,9 +70,9 @@ int main(int argc, char* argv[])
 
     // Distribute A & BT on plane 0
     scatter_data(
-        root, my_rank, my_plane, n, nproc_ij, n_local,
+        root, my_rank, my_plane, n, nproc_ij, local_bs,
         plane_comm, sendcounts, displs, subarrtype,
-        A, BT, M, NT
+        A, B, M, N
     );
     MPI_Barrier(cart_comm);
     
@@ -82,8 +81,8 @@ int main(int argc, char* argv[])
     t0 = MPI_Wtime();
     
     // 1. Replicate input matrix on each plane
-    MPI_Bcast(A,  local_bs, MPI_DOUBLE, 0, dup_comm);
-    MPI_Bcast(BT, local_bs, MPI_DOUBLE, 0, dup_comm);
+    MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
+    MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
 
     // 2. Initial circular shift on A and B
     int dst, src, shift, datatag = 0;
@@ -93,8 +92,10 @@ int main(int argc, char* argv[])
         dst = (j + c * nproc_ij - shift) % nproc_ij;
         src = (j + shift) % nproc_ij;
 
-        MPI_Sendrecv_replace(A, local_bs, MPI_DOUBLE, dst,
-        datatag, src, datatag, row_comm, &status);
+        MPI_Sendrecv_replace(
+            A, local_bs, MPI_DOUBLE, dst,
+            datatag, src, datatag, row_comm, &status
+        );
     }
     shift = j + k * nproc_ij / c;
     if (shift > 0) 
@@ -102,8 +103,10 @@ int main(int argc, char* argv[])
         dst = (i + c * nproc_ij - shift) % nproc_ij;
         src = (i + shift) % nproc_ij;
 
-        MPI_Sendrecv_replace(BT, local_bs, MPI_DOUBLE, dst,
-        datatag, src, datatag, col_comm, &status);
+        MPI_Sendrecv_replace(
+            B, local_bs, MPI_DOUBLE, dst,
+            datatag, src, datatag, col_comm, &status
+        );
     }
     MPI_Barrier(cart_comm);
 
@@ -114,9 +117,9 @@ int main(int argc, char* argv[])
 
     // 3. Initial local DGEMM
     cblas_dgemm(
-        CblasRowMajor, CblasNoTrans, CblasTrans,
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
         n_local, n_local, n_local,
-        1, A, n_local, BT, n_local, 0, C, n_local
+        1, A, n_local, B, n_local, 0, C, n_local
     );
 
     // 4. Do nproc_ij / c steps of Cannon's algorithm
@@ -130,21 +133,21 @@ int main(int argc, char* argv[])
 
         // (2) Send B block to the up and receive a new from the below
         MPI_Sendrecv_replace(
-            BT, local_bs, MPI_DOUBLE, i_dst,
+            B, local_bs, MPI_DOUBLE, i_dst,
             datatag, i_src, datatag, col_comm, &status
         );
         
         // (3) Local DGEMM
         cblas_dgemm(
-            CblasRowMajor, CblasNoTrans, CblasTrans,
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
             n_local, n_local, n_local,
-            1, A, n_local, BT, n_local, 1, C, n_local
+            1, A, n_local, B, n_local, 1, C, n_local
         );
     }
 
     // 5. Reduce sum the result to processes on plane 0
     if (plane == 0) MPI_Reduce(MPI_IN_PLACE, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
-    else            MPI_Reduce(C, C0, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
+    else            MPI_Reduce(C, NULL, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
 
     t1 = MPI_Wtime() - t0;
     double avg_t;
@@ -160,18 +163,17 @@ int main(int argc, char* argv[])
     
     #ifdef VERIFY
     gather_result(
-        root, my_rank, my_plane, n, nproc_ij, n_local,
+        root, my_rank, my_plane, n, nproc_ij, local_bs,
         plane_comm, sendcounts, displs, subarrtype,
-        C, M, NT, P
+        C, M, N, P
     );
     #endif
     
     free(sendcounts);
     free(displs);
-    mkl_free(A); 
-    mkl_free(BT); 
-    mkl_free(C); 
-    mkl_free(C0);
+    mkl_free(A);
+    mkl_free(B);
+    mkl_free(C);
     
     MPI_Type_free(&subarrtype);
     MPI_Comm_free(&row_comm);

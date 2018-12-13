@@ -98,99 +98,77 @@ void init_subarrtype(
     }
 }
 
-void initial_matrix(double** A_addr, double** BT_addr, double** C_addr, int m, int n, int k) 
+void initial_matrix(double **A_addr, double **B_addr, double **C_addr, int m, int n, int k) 
 {
-    double* A  = (double *) mkl_malloc(m * k * sizeof(double), 16);
-    double* BT = (double *) mkl_malloc(n * k * sizeof(double), 16);
-    double* C  = (double *) mkl_malloc(m * n * sizeof(double), 16);
-    *A_addr  = A;
-    *BT_addr = BT;
-    *C_addr  = C;
+    double* A = (double *) mkl_malloc(m * k * sizeof(double), 16);
+    double* B = (double *) mkl_malloc(n * k * sizeof(double), 16);
+    double* C = (double *) mkl_malloc(m * n * sizeof(double), 16);
+    *A_addr = A;
+    *B_addr = B;
+    *C_addr = C;
     
     srand(time(NULL));
     double RMAX = (double) RAND_MAX;
     for (int i = 0; i < m * k; i++) A[i] = (double) rand() / RMAX;
-    for (int i = 0; i < k * n; i++) BT[i] = (double) rand() / RMAX;
+    for (int i = 0; i < k * n; i++) B[i] = (double) rand() / RMAX;
 }
 
-int check_result(double *A, double *BT, double *C, int m, int n, int k, int C_transposed) 
+int check_result(double *A, double *B, double *C, int m, int n, int k) 
 {
     int err_counts = 0;
     double *C_ref = (double *) mkl_malloc(m * n * sizeof(double), 16);
     
     cblas_dgemm(
-        CblasRowMajor, CblasNoTrans, CblasTrans,
-        m, n, k, 1.0, A, k, BT, k, 0.0, C_ref, n
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        m, n, k, 1.0, A, k, B, k, 0.0, C_ref, n
     );
 
-    if (C_transposed)
-    {
-        for (int i = 0; i < m; i++) 
-            for (int j = 0; j < n; j++) 
-                err_counts += (fabs(C[j * m + i] - C_ref[i * n + j]) < 0.0001 ? 0 : 1);
-    } else {
-        for(int i = 0; i < m * n; i++) 
-            err_counts += (fabs(C[i] - C_ref[i]) < 0.0001 ? 0 : 1);
-    }
+    for (int i = 0; i < m * n; i++) 
+        err_counts += (fabs(C[i] - C_ref[i]) < 0.0001 ? 0 : 1);
+
     mkl_free(C_ref);
     
     return err_counts;
 }
 
 void scatter_data(
-    int root, int my_rank, int my_plane, int n, int nproc_ij, int n_local,
+    int root, int my_rank, int my_plane, int n, int nproc_ij, int local_bs,
     MPI_Comm plane_comm, int *sendcounts, int *displs, MPI_Datatype subarrtype,
-    double *A, double *BT, double* M, double* NT
+    double *A, double *B, double *M, double *N
 ) 
 {
 
     if (my_plane == 0) 
     {
         MPI_Scatterv(
-            M, sendcounts,  displs, subarrtype,
-            A, n_local*n_local, MPI_DOUBLE, root, plane_comm
+            M, sendcounts, displs, subarrtype,
+            A, local_bs, MPI_DOUBLE, root, plane_comm
         );
-    }
-    
-    int displsBT[nproc_ij*nproc_ij];
-    int i,j;
-    if (root == my_rank) 
-    {
-        for (int i = 0; i < nproc_ij; i++) 
-        {
-            for (int j = 0; j < nproc_ij; j++) 
-            {
-                displsBT[i*nproc_ij+j] = displs[j*nproc_ij+i];
-            }
-        }
-    }
 
-    if (my_plane == 0) 
-    {
         MPI_Scatterv(
-            NT, sendcounts, displsBT, subarrtype,
-            BT, n_local*n_local, MPI_DOUBLE, root, plane_comm
+            N, sendcounts, displs, subarrtype,
+            B, local_bs, MPI_DOUBLE, root, plane_comm
         );
     }
 }
 
 void gather_result(
-    int root, int my_rank, int my_plane, int n, int nproc_ij, int n_local,
+    int root, int my_rank, int my_plane, int n, int nproc_ij, int local_bs,
     MPI_Comm plane_comm, int *sendcounts,  int *displs, MPI_Datatype subarrtype,
-    double *C, double *M, double *NT, double *P
+    double *C, double *M, double *N, double *P
 ) 
 {
     if (my_plane == 0) 
     {
         MPI_Gatherv(
-            C, n_local*n_local,  MPI_DOUBLE, P, 
+            C, local_bs,  MPI_DOUBLE, P, 
             sendcounts, displs, subarrtype, root, plane_comm
         );
     }
 
     if (my_rank == root) 
     {
-        int err_counts = check_result(M, NT, P, n, n, n, 0); 
+        int err_counts = check_result(M, N, P, n, n, n); 
         if (err_counts) 
         {
             fprintf(stderr, "Check failed: %d errors\n", err_counts);
@@ -198,7 +176,7 @@ void gather_result(
             printf("Result is correct\n");
         }
         mkl_free(M);
-        mkl_free(NT);
+        mkl_free(N);
         mkl_free(P);
     }
 }
