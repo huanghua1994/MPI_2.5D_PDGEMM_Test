@@ -29,15 +29,16 @@ int main(int argc, char* argv[])
     MPI_Comm cart_comm;
     int dims[3] = {nproc_ij, nproc_ij, c};
     int periods[3] = {1, 1, 0};
-    int coords[3], my_row, my_col, my_dup;
+    int coords[3];
     int reorder = 0;
     MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, reorder, &cart_comm);
     MPI_Comm_rank(cart_comm, &my_rank);
     MPI_Cart_coords(cart_comm, my_rank, 3, coords);
     
-    int i = coords[0]; 
-    int j = coords[1]; 
-    int k = coords[2]; 
+    int i, j, k, my_row, my_col, my_plane;
+    i = my_row   = coords[0]; 
+    j = my_col   = coords[1]; 
+    k = my_plane = coords[2]; 
 
     // Split the cart_comm into row_comm, col_comm, dup_comm, and plane_comm
     // row_comm: P(i, *, k), col_comm: P(*, j, k), dup_comm: P(i, j, *), plane_comm: P(*, *, k)
@@ -70,7 +71,7 @@ int main(int argc, char* argv[])
 
     // Distribute A & BT on plane 0
     scatter_data(
-        root, my_rank, coords, n, nproc_ij, n_local,
+        root, my_rank, my_plane, n, nproc_ij, n_local,
         plane_comm, sendcounts, displs, subarrtype,
         A, BT, M, NT
     );
@@ -149,7 +150,7 @@ int main(int argc, char* argv[])
     double avg_t;
     
 
-    if (coords[2] == 0) 
+    if (k == 0) 
     {
         MPI_Reduce(&t1, &avg_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
         avg_t /= (double) (nproc_ij*nproc_ij);
@@ -159,7 +160,7 @@ int main(int argc, char* argv[])
     
     #ifdef VERIFY
     gather_result(
-        root, my_rank, coords, n, nproc_ij, n_local,
+        root, my_rank, my_plane, n, nproc_ij, n_local,
         plane_comm, sendcounts, displs, subarrtype,
         C, M, NT, P
     );
