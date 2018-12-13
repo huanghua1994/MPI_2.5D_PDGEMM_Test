@@ -9,6 +9,58 @@
         }                                                  \
     } while(0)
 
+// Factor nproc = c * nproc_ij * nproc_ij where c is a factor of nproc_ij
+void get_nproc_ij_c(int argc, char **argv, int *_nproc, int *_my_rank, int *_c, int *_nproc_ij)
+{
+    int my_rank, nproc;
+    int c, nproc_ij, succ = 1;
+    
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+    
+    if (argc > 2) 
+    {
+        c = atoi(argv[2]);
+        nproc_ij = (int) sqrt(nproc / c);
+    } else {
+        nproc_ij = (int) sqrt(nproc / 2);
+        c = nproc / (nproc_ij * nproc_ij);
+    }
+    
+    if (nproc_ij * nproc_ij * c != nproc) 
+    {
+        if (my_rank == 0)
+            fprintf(stderr, "[ERROR] nproc = %d, c = %d, cannot decide nproc_ij satisfy c * (nproc_ij)^2 = nproc!!\n", nproc, c);
+        succ = 0;
+    }
+    
+    if (c > nproc_ij) 
+    {
+        if (my_rank == 0)
+            fprintf(stderr, "[ERROR] c = %d is larger than nproc_ij = %d !\n", c, nproc_ij);
+        succ = 0;
+    }
+    
+    if (nproc_ij % c != 0)
+    {
+        if (my_rank == 0)
+            fprintf(stderr, "[ERROR] c = %d is not a factor of nproc_ij = %d !\n", c, nproc_ij);
+        succ = 0;
+    }
+    
+    if (succ == 0)
+    {
+        MPI_Finalize();
+        exit(1);
+    }
+    
+    *_nproc = nproc;
+    *_my_rank = my_rank;
+    *_c = c;
+    *_nproc_ij = nproc_ij;
+}
+
+
 int get_problem_size(int argc, char* argv[], int dim_sz, int me) 
 {
     int n = dim_sz; //problem size
