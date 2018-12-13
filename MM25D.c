@@ -77,36 +77,35 @@ int main(int argc, char* argv[])
     if (my_rank == 0) printf("[MMM25D] nproc = %d, n = %d, nproc_ij = %d, c = %d\n", nproc, n, nproc_ij, c);
 
     //prepare for the cartesian topology
-    MPI_Comm cartcomm;
+    MPI_Comm cart_comm;
     int dims[3] = {nproc_ij, nproc_ij, c};
-    int periods[3] = {1,1,0}, reorder=0,coords[3];
-    mpi_check(MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, reorder, &cartcomm));
-    MPI_Comm_rank(cartcomm, &my_rank);
-    MPI_Cart_coords(cartcomm, my_rank, 3, coords);
+    int periods[3] = {1, 1, 0};
+    int coords[3];
+    int reorder = 0;
+    MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, reorder, &cart_comm);
+    MPI_Comm_rank(cart_comm, &my_rank);
+    MPI_Cart_coords(cart_comm, my_rank, 3, coords);
 
-    //Split the cartcomm into rowcomm, colcomm
-    MPI_Comm rowcomm, colcomm, depthcomm;
-    MPI_Comm_split(cartcomm, coords[1]*nproc_ij+coords[2], coords[0], &colcomm); //i as rank
-    MPI_Comm_split(cartcomm, coords[0]*nproc_ij+coords[2], coords[1], &rowcomm); //j as rank
-    MPI_Comm_split(cartcomm, coords[0]*nproc_ij+coords[1], coords[2], &depthcomm); //k as rank
-
-    MPI_Comm dim_ij_comm; //used for scatter data and collect result
-    MPI_Comm_split(cartcomm, coords[2], coords[0]*nproc_ij+coords[1], &dim_ij_comm); //ij as rank
+    // Split the cart_comm into row_comm, col_comm, dup_comm, and plane_comm
+    // row_comm: P(i, *, k), col_comm: P(*, j, k), dup_comm: P(i, j, *), plane_comm: P(*, *, k)
+    MPI_Comm row_comm, col_comm, dup_comm, plane_comm;
+    int remain_i[3]  = {1, 0, 0};
+    int remain_j[3]  = {0, 1, 0};
+    int remain_k[3]  = {0, 0, 1};
+    int remain_ij[3] = {1, 1, 0};
+    MPI_Cart_sub(cart_comm, remain_j,  &row_comm);
+    MPI_Cart_sub(cart_comm, remain_i,  &col_comm);
+    MPI_Cart_sub(cart_comm, remain_k,  &dup_comm);
+    MPI_Cart_sub(cart_comm, remain_ij, &plane_comm);
 
     double *M, *NT, *P;
-    int root_coords[3] = {0,0,0}; //with zero first
-    MPI_Cart_rank(cartcomm, root_coords, &root); //get the dst
-    if (root == my_rank) {
-        initial_matrix(&M, &NT, &P, n, n, n);
-    }
+    if (0 == my_rank) initial_matrix(&M, &NT, &P, n, n, n);
 
-    //now each process has a small portion of local
-    /*The matrix size is p * p*/
     int i, j, k;
-    double *A = (double*)mkl_malloc(n_local * n_local * sizeof(double), 16);
-    double *BT = (double*)mkl_malloc(n_local * n_local * sizeof(double), 16); //j, k
-    double *C = (double*)mkl_malloc(n_local * n_local * sizeof(double), 16);
-    double *C0 = (double*)mkl_malloc(n_local * n_local * sizeof(double), 16);
+    double *A  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *BT = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *C  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *C0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
 
     //Scatter and Gather used data types
     MPI_Datatype subarrtype;
@@ -116,17 +115,17 @@ int main(int argc, char* argv[])
 
     //Now A/BT local are ready accorss layer 0.
     scatter_data(root, my_rank, coords, n, nproc_ij, n_local,
-            dim_ij_comm, sendcounts, displs, subarrtype,
+            plane_comm, sendcounts, displs, subarrtype,
             A, BT, M, NT);
 
-    mpi_check(MPI_Barrier(cartcomm));
+    mpi_check(MPI_Barrier(cart_comm));
     double t0, t1;
     //Start timing point
     t0 = MPI_Wtime();
     //the main MMM25D algorithm part
     //The real start point.
-    mpi_check(MPI_Bcast(A, n_local*n_local, MPI_DOUBLE, 0, depthcomm));
-    mpi_check(MPI_Bcast(BT,n_local*n_local, MPI_DOUBLE, 0, depthcomm));
+    mpi_check(MPI_Bcast(A, n_local*n_local, MPI_DOUBLE, 0, dup_comm));
+    mpi_check(MPI_Bcast(BT,n_local*n_local, MPI_DOUBLE, 0, dup_comm));
 
     //first need shift both A and B.
     int dst, src; //use for shift
@@ -138,7 +137,7 @@ int main(int argc, char* argv[])
         src = (coords[1] + shift) % nproc_ij;
 
         MPI_Sendrecv_replace(A, n_local*n_local, MPI_DOUBLE, dst,
-        datatag, src, datatag, rowcomm, &status);
+        datatag, src, datatag, row_comm, &status);
     }
 
     shift = coords[1] + coords[2] * nproc_ij / c;
@@ -147,10 +146,10 @@ int main(int argc, char* argv[])
         src = (coords[0] + shift) % nproc_ij;
 
         MPI_Sendrecv_replace(BT, n_local*n_local, MPI_DOUBLE, dst,
-        datatag, src, datatag, colcomm, &status);
+        datatag, src, datatag, col_comm, &status);
     }
 
-    mpi_check(MPI_Barrier(cartcomm));
+    mpi_check(MPI_Barrier(cart_comm));
     //finish initial shift
 
 
@@ -171,11 +170,11 @@ int main(int argc, char* argv[])
     {
         /* Send submatrix of A left and receive a new from right */
         MPI_Sendrecv_replace(A, n_local*n_local, MPI_DOUBLE, j_dst,
-        datatag, j_src, datatag, rowcomm, &status);
+        datatag, j_src, datatag, row_comm, &status);
 
         /* Send submatrix of B up and receive a new from below */
         MPI_Sendrecv_replace(BT, n_local*n_local, MPI_DOUBLE, i_dst,
-        datatag, i_src, datatag, colcomm, &status);
+        datatag, i_src, datatag, col_comm, &status);
 
         cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 n_local, n_local, n_local,
@@ -184,12 +183,12 @@ int main(int argc, char* argv[])
 
     //now do depth reduction
     int plane;
-    MPI_Comm_rank(depthcomm, &plane);
+    MPI_Comm_rank(dup_comm, &plane);
     if (plane == 0)
     {
-        MPI_Reduce(MPI_IN_PLACE, C, n_local*n_local, MPI_DOUBLE, MPI_SUM, 0, depthcomm);
+        MPI_Reduce(MPI_IN_PLACE, C, n_local*n_local, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
     } else {
-        MPI_Reduce(C, C0, n_local*n_local, MPI_DOUBLE, MPI_SUM, 0, depthcomm);
+        MPI_Reduce(C, C0, n_local*n_local, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
     }
 
     //End timing
@@ -200,7 +199,7 @@ int main(int argc, char* argv[])
     //use reduction to collect the final timy_rank
     if (coords[2] == 0) 
     {
-        MPI_Reduce(&t1, &avg_t, 1, MPI_DOUBLE, MPI_SUM, root, dim_ij_comm);
+        MPI_Reduce(&t1, &avg_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
         avg_t /= (double) (nproc_ij*nproc_ij);
         
         if (my_rank == root) printf("[mmm25D]nproc=%d, N=%d, C=%d, Time=%.9f\n", nproc, n, c, avg_t);
@@ -209,14 +208,23 @@ int main(int argc, char* argv[])
     #ifdef VERIFY
     gather_result(
         root, my_rank, coords, n, nproc_ij, n_local,
-        dim_ij_comm, sendcounts, displs, subarrtype,
+        plane_comm, sendcounts, displs, subarrtype,
         C, M, NT, P
     );
     #endif
     
+    
+    mkl_free(A); 
+    mkl_free(BT); 
+    mkl_free(C); 
+    mkl_free(C0);
+    
     MPI_Type_free(&subarrtype);
-    MPI_Comm_free(&dim_ij_comm);
-    mkl_free(A); mkl_free(BT); mkl_free(C); mkl_free(C0);
+    MPI_Comm_free(&row_comm);
+    MPI_Comm_free(&col_comm);
+    MPI_Comm_free(&dup_comm);
+    MPI_Comm_free(&plane_comm);
     MPI_Finalize();
+    
     return 0;
 }
