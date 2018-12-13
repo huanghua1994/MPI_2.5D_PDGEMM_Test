@@ -61,32 +61,23 @@ void get_nproc_ij_c(int argc, char **argv, int *_nproc, int *_my_rank, int *_c, 
 }
 
 
-int get_problem_size(int argc, char* argv[], int dim_sz, int me) 
+int get_problem_size(int argc, char **argv, int dim_sz, int my_rank) 
 {
-    int n = dim_sz; //problem size
-    if(argc > 1) {
-      n = atoi(argv[1]);
-      /*Padding the matrix to so that each process get the same size*/
-      int per_n = (n - 1) / dim_sz + 1;
-      if(per_n * dim_sz != n) {
-          if(me == 0) {
-              fprintf(stdout, "[MMM1DRow]Warning: Padding the problem size from %d to %d, Grid size is %d!\n", n, per_n * dim_sz, dim_sz);
-          }
-          n = per_n * dim_sz;
-      } else {
-          if(me == 0) {
-              fprintf(stdout, "[MMM1DRow]Problem size is %d, Grid size is %d!\n", n, dim_sz);
-          }
-      }
+    int n = dim_sz; 
+    if(argc > 1) 
+    {
+        n = atoi(argv[1]);
+        // Padding the matrix to so that each process get the same size
+        int per_n = (n - 1) / dim_sz + 1;
+        if (per_n * dim_sz != n) 
+        {
+            if (my_rank == 0) printf("Warning: Padding the problem size from %d to %d, grid size is %d \n", n, per_n * dim_sz, dim_sz);
+            n = per_n * dim_sz;
+        } else {
+          if (my_rank == 0) printf("Problem size is %d, grid size is %d \n", n, dim_sz);
+        }
     }
     return n;
-}
-
-void free_matrix(double* A, double* B, double *C) 
-{
-    mkl_free(A);
-    mkl_free(B);
-    mkl_free(C);
 }
 
 void init_subarrtype(int root, int me,
@@ -204,24 +195,27 @@ void gather_result(int root, int me, int coords[3],
         double C[n_local*n_local],
         double* M, double* NT, double* P) 
 {
-    if(coords[2] == 0) {
-        mpi_check(MPI_Gatherv(C, n_local*n_local,  MPI_DOUBLE,
-                     P, sendcounts, displs, subarrtype,
-                     root, dim_ij_comm));
+    if(coords[2] == 0) 
+    {
+        MPI_Gatherv(
+            C, n_local*n_local,  MPI_DOUBLE, P, 
+            sendcounts, displs, subarrtype, root, dim_ij_comm
+        );
     }
 
-
     //all in root now
-    if(me == root) {
-        int err_c = check_result(M, NT, P, n, n, n, 0); //not transposed
-        if (err_c) {
-            fprintf(stderr, "[MMM25D]Check Failure: %d errors\n", err_c);
-            //print_matrix("P", P, n, n, 0);
+    if (me == root) 
+    {
+        int err_c = check_result(M, NT, P, n, n, n, 0); // not transposed
+        if (err_c) 
+        {
+            fprintf(stderr, "Check failed: %d errors\n", err_c);
         } else {
-            printf("[MMM52D]Result is verified\n");
-            //print_matrix("C", P, n, n, 0);
+            printf("Result is correct\n");
         }
-        free_matrix(M, NT, P);
+        mkl_free(M);
+        mkl_free(NT);
+        mkl_free(P);
     }
 }
 

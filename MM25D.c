@@ -23,7 +23,7 @@ int main(int argc, char* argv[])
     int n = get_problem_size(argc, argv, nproc_ij, my_rank);
     int n_local = n / nproc_ij;
     int local_bs = n_local * n_local;
-    if (my_rank == 0) printf("[MMM25D] nproc = %d, n = %d, nproc_ij = %d, c = %d\n", nproc, n, nproc_ij, c);
+    if (my_rank == 0) printf("nproc = %d, n = %d, nproc_ij = %d, c = %d\n", nproc, n, nproc_ij, c);
 
     //prepare for the cartesian topology
     MPI_Comm cart_comm;
@@ -85,9 +85,8 @@ int main(int argc, char* argv[])
     MPI_Bcast(BT, local_bs, MPI_DOUBLE, 0, dup_comm);
 
     // 2. Initial circular shift on A and B
-    int dst, src, datatag = 0;
-    // For the i-th row of the subtasks grid matrix A block is shifted to the left,
-    int shift = i + k * nproc_ij / c;
+    int dst, src, shift, datatag = 0;
+    shift = i + k * nproc_ij / c;
     if (shift > 0) 
     {
         dst = (j + c * nproc_ij - shift) % nproc_ij;
@@ -96,7 +95,6 @@ int main(int argc, char* argv[])
         MPI_Sendrecv_replace(A, local_bs, MPI_DOUBLE, dst,
         datatag, src, datatag, row_comm, &status);
     }
-
     shift = j + k * nproc_ij / c;
     if (shift > 0) 
     {
@@ -106,7 +104,6 @@ int main(int argc, char* argv[])
         MPI_Sendrecv_replace(BT, local_bs, MPI_DOUBLE, dst,
         datatag, src, datatag, col_comm, &status);
     }
-
     MPI_Barrier(cart_comm);
 
     int j_dst = (j + nproc_ij - 1) % nproc_ij;
@@ -157,7 +154,7 @@ int main(int argc, char* argv[])
         MPI_Reduce(&t1, &avg_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
         avg_t /= (double) (nproc_ij*nproc_ij);
         
-        if (my_rank == root) printf("[mmm25D]nproc=%d, N=%d, C=%d, Time=%.9f\n", nproc, n, c, avg_t);
+        if (my_rank == root) printf("PDGEMM 2.5D time = %.4lf (s) \n", avg_t);
     }
     
     #ifdef VERIFY
