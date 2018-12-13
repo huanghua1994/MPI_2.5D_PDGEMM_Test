@@ -29,11 +29,15 @@ int main(int argc, char* argv[])
     MPI_Comm cart_comm;
     int dims[3] = {nproc_ij, nproc_ij, c};
     int periods[3] = {1, 1, 0};
-    int coords[3];
+    int coords[3], my_row, my_col, my_dup;
     int reorder = 0;
     MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, reorder, &cart_comm);
     MPI_Comm_rank(cart_comm, &my_rank);
     MPI_Cart_coords(cart_comm, my_rank, 3, coords);
+    
+    int i = coords[0]; 
+    int j = coords[1]; 
+    int k = coords[2]; 
 
     // Split the cart_comm into row_comm, col_comm, dup_comm, and plane_comm
     // row_comm: P(i, *, k), col_comm: P(*, j, k), dup_comm: P(i, j, *), plane_comm: P(*, *, k)
@@ -53,7 +57,6 @@ int main(int argc, char* argv[])
     double *M, *NT, *P;
     if (0 == my_rank) initial_matrix(&M, &NT, &P, n, n, n);
 
-    int i, j, k;
     double *A  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *BT = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *C  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
@@ -77,64 +80,63 @@ int main(int argc, char* argv[])
     
     t0 = MPI_Wtime();
     
-    //the main MMM25D algorithm part
-    //The real start point.
+    // 1. Replicate input matrix on each plane
     MPI_Bcast(A,  local_bs, MPI_DOUBLE, 0, dup_comm);
     MPI_Bcast(BT, local_bs, MPI_DOUBLE, 0, dup_comm);
 
-    //first need shift both A and B.
-    int dst, src; //use for shift
-    int datatag = 0;
+    // 2. Initial circular shift on A and B
+    int dst, src, datatag = 0;
     // For the i-th row of the subtasks grid matrix A block is shifted to the left,
-    int shift = coords[0] + coords[2] * nproc_ij / c;
-    if(shift > 0) 
+    int shift = i + k * nproc_ij / c;
+    if (shift > 0) 
     {
-        dst = (coords[1] +  c*nproc_ij - shift) % nproc_ij;
-        src = (coords[1] + shift) % nproc_ij;
+        dst = (j + c * nproc_ij - shift) % nproc_ij;
+        src = (j + shift) % nproc_ij;
 
         MPI_Sendrecv_replace(A, local_bs, MPI_DOUBLE, dst,
         datatag, src, datatag, row_comm, &status);
     }
 
-    shift = coords[1] + coords[2] * nproc_ij / c;
-    if(shift > 0) {
-        dst = (coords[0] +  c*nproc_ij - shift) % nproc_ij;
-        src = (coords[0] + shift) % nproc_ij;
+    shift = j + k * nproc_ij / c;
+    if (shift > 0) 
+    {
+        dst = (i + c * nproc_ij - shift) % nproc_ij;
+        src = (i + shift) % nproc_ij;
 
         MPI_Sendrecv_replace(BT, local_bs, MPI_DOUBLE, dst,
         datatag, src, datatag, col_comm, &status);
     }
 
     MPI_Barrier(cart_comm);
-    // Finish initial shift
 
-    int j_dst = (coords[1] +nproc_ij - 1) % nproc_ij; //used for BT's shift
-    int j_src = (coords[1] + 1) % nproc_ij; //used for BT's shift
-    int i_dst = (coords[0] +nproc_ij - 1) % nproc_ij; //used for BT's shift
-    int i_src = (coords[0] + 1) % nproc_ij; //used for BT's shift
+    int j_dst = (j + nproc_ij - 1) % nproc_ij;
+    int j_src = (j + 1) % nproc_ij;
+    int i_dst = (i + nproc_ij - 1) % nproc_ij; 
+    int i_src = (i + 1) % nproc_ij; 
 
-    //reference: http://www.hpcc.unn.ru/mskurs/ENG/PPT/pp08.pdf
-
+    // 3. Initial local DGEMM
     cblas_dgemm(
         CblasRowMajor, CblasNoTrans, CblasTrans,
         n_local, n_local, n_local,
         1, A, n_local, BT, n_local, 0, C, n_local
     );
 
-    for (int stage = 1; stage < nproc_ij/c; stage++) 
+    // 4. Do nproc_ij / c steps of Cannon's algorithm
+    for (int stage = 1; stage < nproc_ij / c; stage++) 
     {
-        // Send submatrix of A left and receive a new from right
+        // (1) Send A block to the left and receive a new from the right
         MPI_Sendrecv_replace(
             A, local_bs, MPI_DOUBLE, j_dst,
             datatag, j_src, datatag, row_comm, &status
         );
 
-        // Send submatrix of B up and receive a new from below
+        // (2) Send B block to the up and receive a new from the below
         MPI_Sendrecv_replace(
             BT, local_bs, MPI_DOUBLE, i_dst,
             datatag, i_src, datatag, col_comm, &status
         );
-
+        
+        // (3) Local DGEMM
         cblas_dgemm(
             CblasRowMajor, CblasNoTrans, CblasTrans,
             n_local, n_local, n_local,
@@ -142,8 +144,7 @@ int main(int argc, char* argv[])
         );
     }
 
-    // Reduce sum the result to processes on plane 0
-    
+    // 5. Reduce sum the result to processes on plane 0
     if (plane == 0) MPI_Reduce(MPI_IN_PLACE, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
     else            MPI_Reduce(C, C0, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
 
