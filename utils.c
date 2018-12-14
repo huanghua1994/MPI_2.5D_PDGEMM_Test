@@ -50,50 +50,51 @@ void get_nproc_ij_c(int argc, char **argv, int *_nproc, int *_my_rank, int *_c, 
     *_nproc_ij = nproc_ij;
 }
 
-int get_problem_size(int argc, char **argv, int dim_sz, int my_rank) 
+int get_problem_size(int argc, char **argv, int nproc_ij, int my_rank) 
 {
-    int n = dim_sz; 
+    int n = nproc_ij; 
     if(argc > 1) 
     {
         n = atoi(argv[1]);
         // Pad the matrix to so that each process get the same size
-        int local_n = (n - 1) / dim_sz + 1;
-        if (local_n * dim_sz != n) 
+        int n_local = (n - 1) / nproc_ij + 1;
+        if (n_local * nproc_ij != n) 
         {
-            if (my_rank == 0) printf("Warning: Padding the problem size from %d to %d, grid size is %d \n", n, local_n * dim_sz, dim_sz);
-            n = local_n * dim_sz;
+            if (my_rank == 0) printf("Warning: Padding the problem size from %d to %d, grid size is %d \n", n, n_local * nproc_ij, nproc_ij);
+            n = n_local * nproc_ij;
         } else {
-          if (my_rank == 0) printf("Problem size is %d, grid size is %d \n", n, dim_sz);
+          if (my_rank == 0) printf("Problem size is %d, grid size is %d \n", n, nproc_ij);
         }
     }
     return n;
 }
 
+// An elegant by abstracted way: https://stackoverflow.com/questions/9269399/sending-blocks-of-2d-array-in-c-using-mpi/9271753#9271753
 void init_subarrtype(
-    int root, int my_rank, int n, int dim_sz, int local_n,
+    int root, int my_rank, int n, int nproc_ij, int n_local,
     MPI_Datatype* subarrtype_addr, int *sendcounts, int *displs
 ) 
 {
     int sizes[2]    = {n, n};         
-    int subsizes[2] = {local_n, local_n};
+    int subsizes[2] = {n_local, n_local};
     int starts[2]   = {0, 0};
 
     MPI_Datatype type;
     MPI_Type_create_subarray(2, sizes, subsizes, starts, MPI_ORDER_C, MPI_DOUBLE, &type);
-    MPI_Type_create_resized(type, 0, local_n * sizeof(double), subarrtype_addr);
+    MPI_Type_create_resized(type, 0, n_local * sizeof(double), subarrtype_addr);
     MPI_Type_commit(subarrtype_addr);
     if (my_rank == root) 
     {
-        for (int i = 0; i < dim_sz * dim_sz; i++) sendcounts[i] = 1;
+        for (int i = 0; i < nproc_ij * nproc_ij; i++) sendcounts[i] = 1;
         int disp = 0;
-        for (int i = 0; i < dim_sz; i++) 
+        for (int i = 0; i < nproc_ij; i++) 
         {
-            for (int j = 0; j < dim_sz; j++) 
+            for (int j = 0; j < nproc_ij; j++) 
             {
-                displs[i * dim_sz + j] = disp;
+                displs[i * nproc_ij + j] = disp;
                 disp += 1;
             }
-            disp += (local_n - 1) * dim_sz;
+            disp += (n_local - 1) * nproc_ij;
         }
     }
 }
