@@ -23,9 +23,9 @@ int main(int argc, char **argv)
     int n = get_problem_size(argc, argv, nproc_ij, my_rank);
     int n_local = n / nproc_ij;
     int local_bs = n_local * n_local;
-    int ntest;
+    int ntest = 10;
     if (argc >= 4) ntest = atoi(argv[3]);
-    if (ntest < 1 || ntest > 20) ntest = 10;
+    if (ntest < 1 || ntest > 50) ntest = 10;
     if (my_rank == 0) 
     {
         printf("Test settings:\n");
@@ -181,7 +181,7 @@ int main(int argc, char **argv)
         st1 = MPI_Wtime();
         MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
         et1 = MPI_Wtime();
-        dgemm_t += et1 - st1;
+        comm_t += et1 - st1;
         
         et0 = MPI_Wtime();
         total_t += et0 - st0;
