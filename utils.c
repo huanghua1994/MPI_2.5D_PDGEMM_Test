@@ -60,10 +60,8 @@ int get_problem_size(int argc, char **argv, int nproc_ij, int my_rank)
         int n_local = (n - 1) / nproc_ij + 1;
         if (n_local * nproc_ij != n) 
         {
-            if (my_rank == 0) printf("Warning: Padding the problem size from %d to %d, grid size is %d \n", n, n_local * nproc_ij, nproc_ij);
+            if (my_rank == 0) printf("Warning: Padding the problem size from %d to %d\n", n, n_local * nproc_ij);
             n = n_local * nproc_ij;
-        } else {
-          if (my_rank == 0) printf("Problem size is %d, grid size is %d \n", n, nproc_ij);
         }
     }
     return n;

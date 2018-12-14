@@ -6,11 +6,11 @@
 #include "mpi.h"
 #include "mkl.h"
 
-#define VERIFY
+// #define VERIFY
 
 #include "utils.c"
 
-int main(int argc, char* argv[]) 
+int main(int argc, char **argv) 
 {
     int root = 0;
     MPI_Status status; 
@@ -23,7 +23,17 @@ int main(int argc, char* argv[])
     int n = get_problem_size(argc, argv, nproc_ij, my_rank);
     int n_local = n / nproc_ij;
     int local_bs = n_local * n_local;
-    if (my_rank == 0) printf("nproc = %d, n = %d, nproc_ij = %d, c = %d\n", nproc, n, nproc_ij, c);
+    int ntest;
+    if (argc >= 4) ntest = atoi(argv[3]);
+    if (ntest < 1 || ntest > 20) ntest = 10;
+    if (my_rank == 0) 
+    {
+        printf("Test settings:\n");
+        printf("  * Process grid : %d * %d * %d (c = %d)\n", nproc_ij, nproc_ij, c, c);
+        printf("  * Matrix size  : Global N = %d, local N = %d\n", n, n_local);
+        printf("  * Repeat tests : %d\n", ntest);
+        printf("\n");
+    }
 
     //prepare for the cartesian topology
     MPI_Comm cart_comm;
@@ -63,13 +73,13 @@ int main(int argc, char* argv[])
     double *C  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *C0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
 
-    //Scatter and Gather used data types
+    // Scatter and Gather used data types
     MPI_Datatype subarrtype;
     int *sendcounts = (int *) malloc(nproc_ij * nproc_ij * sizeof(int));
     int *displs = (int *) malloc(nproc_ij * nproc_ij * sizeof(int));
     init_subarrtype(root, my_rank, n, nproc_ij, n_local, &subarrtype, sendcounts, displs);
 
-    // Distribute A & BT on plane 0
+    // Distribute A & B on plane 0
     scatter_data(
         root, my_rank, my_plane, n, nproc_ij, local_bs,
         plane_comm, sendcounts, displs, subarrtype,
@@ -77,89 +87,128 @@ int main(int argc, char* argv[])
     );
     MPI_Barrier(cart_comm);
     
-    double t0, t1;
+    double st0, et0, st1, et1;
+    double comm_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
-    t0 = MPI_Wtime();
-    
-    // 1. Replicate input matrix on each plane
-    MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
-    MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
-
-    // 2. Initial circular shift on A and B
-    int dst, src, shift, datatag;
-    // The shift formula here is different from the 2.5D paper, but it works...
-    shift = i + k * nproc_ij / c;
-    if (shift > 0) 
+    for (int itest = 0; itest < ntest; itest++)
     {
-        datatag = 0;
-        dst = (j + c * nproc_ij - shift) % nproc_ij;
-        src = (j + shift) % nproc_ij;
-        MPI_Sendrecv_replace(
-            A, local_bs, MPI_DOUBLE, dst, datatag, 
-            src, datatag, row_comm, &status
-        );
-    }
-    shift = j + k * nproc_ij / c;
-    if (shift > 0) 
-    {
-        datatag = 1;
-        dst = (i + c * nproc_ij - shift) % nproc_ij;
-        src = (i + shift) % nproc_ij;
-        MPI_Sendrecv_replace(
-            B, local_bs, MPI_DOUBLE, dst, datatag, 
-            src, datatag, col_comm, &status
-        );
-    }
-    MPI_Barrier(cart_comm);
-
-    // 3. Initial local DGEMM
-    cblas_dgemm(
-        CblasRowMajor, CblasNoTrans, CblasNoTrans,
-        n_local, n_local, n_local,
-        1, A, n_local, B, n_local, 0, C0, n_local
-    );
-
-    // 4. Do nproc_ij / c steps of Cannon's algorithm
-    int j_dst = (j + 1) % nproc_ij;
-    int i_dst = (i + 1) % nproc_ij; 
-    int j_src = (j - 1 + nproc_ij) % nproc_ij;
-    int i_src = (i - 1 + nproc_ij) % nproc_ij; 
-    for (int stage = 1; stage < nproc_ij / c; stage++) 
-    {
-        datatag = stage + 1;
+        memset(C0, 0, local_bs * sizeof(double));
+        memset(C , 0, local_bs * sizeof(double));
+        MPI_Barrier(MPI_COMM_WORLD);
         
-        // (1) Send A block to the right and receive a new from the left
-        MPI_Sendrecv_replace(
-            A, local_bs, MPI_DOUBLE, j_dst, datatag, 
-            j_src, datatag, row_comm, &status
-        );
-
-        // (2) Send B block to the below and receive a new from the up
-        MPI_Sendrecv_replace(
-            B, local_bs, MPI_DOUBLE, i_dst, datatag, 
-            i_src, datatag, col_comm, &status
-        );
+        st0 = MPI_Wtime();
+        st1 = MPI_Wtime();
         
-        // (3) Local DGEMM
+        // 1. Replicate input matrix on each plane
+        MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
+        MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
+        
+        // 2. Initial circular shift on A and B
+        int dst, src, shift, datatag;
+        // The shift formula here is different from the 2.5D paper, but it works...
+        shift = i + k * nproc_ij / c;
+        if (shift > 0) 
+        {
+            datatag = 0;
+            dst = (j + c * nproc_ij - shift) % nproc_ij;
+            src = (j + shift) % nproc_ij;
+            MPI_Sendrecv_replace(
+                A, local_bs, MPI_DOUBLE, dst, datatag, 
+                src, datatag, row_comm, &status
+            );
+        }
+        shift = j + k * nproc_ij / c;
+        if (shift > 0) 
+        {
+            datatag = 1;
+            dst = (i + c * nproc_ij - shift) % nproc_ij;
+            src = (i + shift) % nproc_ij;
+            MPI_Sendrecv_replace(
+                B, local_bs, MPI_DOUBLE, dst, datatag, 
+                src, datatag, col_comm, &status
+            );
+        }
+        
+        et1 = MPI_Wtime();
+        comm_t += et1 - st1;
+        
+        // 3. Initial local DGEMM
+        st1 = MPI_Wtime();
         cblas_dgemm(
             CblasRowMajor, CblasNoTrans, CblasNoTrans,
             n_local, n_local, n_local,
-            1, A, n_local, B, n_local, 1, C0, n_local
+            1, A, n_local, B, n_local, 0, C0, n_local
         );
-    }
+        et1 = MPI_Wtime();
+        dgemm_t += et1 - st1;
 
-    // 5. Reduce sum the result to processes on plane 0
-    MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
+        // 4. Do nproc_ij / c steps of Cannon's algorithm
+        int j_dst = (j + 1) % nproc_ij;
+        int i_dst = (i + 1) % nproc_ij; 
+        int j_src = (j - 1 + nproc_ij) % nproc_ij;
+        int i_src = (i - 1 + nproc_ij) % nproc_ij; 
+        for (int stage = 1; stage < nproc_ij / c; stage++) 
+        {
+            datatag = stage + 1;
+            
+            st1 = MPI_Wtime();
+            
+            // (1) Send A block to the right and receive a new from the left
+            MPI_Sendrecv_replace(
+                A, local_bs, MPI_DOUBLE, j_dst, datatag, 
+                j_src, datatag, row_comm, &status
+            );
 
-    t1 = MPI_Wtime() - t0;
-    double avg_t;
-    
-    if (k == 0) 
-    {
-        MPI_Reduce(&t1, &avg_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        avg_t /= (double) (nproc_ij*nproc_ij);
+            // (2) Send B block to the below and receive a new from the up
+            MPI_Sendrecv_replace(
+                B, local_bs, MPI_DOUBLE, i_dst, datatag, 
+                i_src, datatag, col_comm, &status
+            );
+            
+            et1 = MPI_Wtime();
+            comm_t += et1 - st1;
+            
+            // (3) Local DGEMM
+            st1 = MPI_Wtime();
+            cblas_dgemm(
+                CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                n_local, n_local, n_local,
+                1, A, n_local, B, n_local, 1, C0, n_local
+            );
+            et1 = MPI_Wtime();
+            dgemm_t += et1 - st1;
+        }
+
+        // 5. Reduce sum the result to processes on plane 0
+        st1 = MPI_Wtime();
+        MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
+        et1 = MPI_Wtime();
+        dgemm_t += et1 - st1;
         
-        if (my_rank == root) printf("PDGEMM 2.5D time = %.4lf (s) \n", avg_t);
+        et0 = MPI_Wtime();
+        total_t += et0 - st0;
+    }
+    
+    double GFlop = 2.0 * (double) n * (double) n * (double) n * (double) ntest / 1000000000.0;
+    
+    double avg_comm_t, avg_dgemm_t, avg_total_t;
+    
+    if (my_plane == 0) 
+    {
+        MPI_Reduce(&comm_t,  &avg_comm_t,  1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&dgemm_t, &avg_dgemm_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&total_t, &avg_total_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        avg_comm_t  /= (double) (nproc_ij * nproc_ij);
+        avg_dgemm_t /= (double) (nproc_ij * nproc_ij);
+        avg_total_t /= (double) (nproc_ij * nproc_ij);
+        
+        if (my_rank == root) 
+        {
+            printf("PDGEMM 2.5D algorithm %d runs average timing:\n", ntest);
+            printf("  * Communication = %.2lf (s)\n", avg_comm_t);
+            printf("  * Local DGEMM   = %.2lf (s), %.2lf GFlops\n", avg_dgemm_t, GFlop / avg_dgemm_t);
+            printf("  * Overall       = %.2lf (s), %.2lf GFlops\n", avg_total_t, GFlop / avg_total_t);
+        }
     }
     
     #ifdef VERIFY
