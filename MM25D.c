@@ -93,8 +93,8 @@ int main(int argc, char* argv[])
         src = (j + shift) % nproc_ij;
 
         MPI_Sendrecv_replace(
-            A, local_bs, MPI_DOUBLE, dst,
-            datatag, src, datatag, row_comm, &status
+            A, local_bs, MPI_DOUBLE, dst, datatag, 
+            src, datatag, row_comm, &status
         );
     }
     shift = j + k * nproc_ij / c;
@@ -104,16 +104,11 @@ int main(int argc, char* argv[])
         src = (i + shift) % nproc_ij;
 
         MPI_Sendrecv_replace(
-            B, local_bs, MPI_DOUBLE, dst,
-            datatag, src, datatag, col_comm, &status
+            B, local_bs, MPI_DOUBLE, dst, datatag, 
+            src, datatag, col_comm, &status
         );
     }
     MPI_Barrier(cart_comm);
-
-    int j_dst = (j + nproc_ij - 1) % nproc_ij;
-    int j_src = (j + 1) % nproc_ij;
-    int i_dst = (i + nproc_ij - 1) % nproc_ij; 
-    int i_src = (i + 1) % nproc_ij; 
 
     // 3. Initial local DGEMM
     cblas_dgemm(
@@ -123,18 +118,24 @@ int main(int argc, char* argv[])
     );
 
     // 4. Do nproc_ij / c steps of Cannon's algorithm
+    int j_dst = (j + 1) % nproc_ij;
+    int i_dst = (i + 1) % nproc_ij; 
+    int j_src = (j - 1 + nproc_ij) % nproc_ij;
+    int i_src = (i - 1 + nproc_ij) % nproc_ij; 
     for (int stage = 1; stage < nproc_ij / c; stage++) 
     {
-        // (1) Send A block to the left and receive a new from the right
+        datatag = stage;
+        
+        // (1) Send A block to the right and receive a new from the left
         MPI_Sendrecv_replace(
-            A, local_bs, MPI_DOUBLE, j_dst,
-            datatag, j_src, datatag, row_comm, &status
+            A, local_bs, MPI_DOUBLE, j_dst, datatag, 
+            j_src, datatag, row_comm, &status
         );
 
-        // (2) Send B block to the up and receive a new from the below
+        // (2) Send B block to the below and receive a new from the up
         MPI_Sendrecv_replace(
-            B, local_bs, MPI_DOUBLE, i_dst,
-            datatag, i_src, datatag, col_comm, &status
+            B, local_bs, MPI_DOUBLE, i_dst, datatag, 
+            i_src, datatag, col_comm, &status
         );
         
         // (3) Local DGEMM
@@ -152,7 +153,6 @@ int main(int argc, char* argv[])
     t1 = MPI_Wtime() - t0;
     double avg_t;
     
-
     if (k == 0) 
     {
         MPI_Reduce(&t1, &avg_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
