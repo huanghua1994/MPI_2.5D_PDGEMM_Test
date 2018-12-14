@@ -61,6 +61,7 @@ int main(int argc, char* argv[])
     double *A  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *B  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *C  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *C0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
 
     //Scatter and Gather used data types
     MPI_Datatype subarrtype;
@@ -85,13 +86,14 @@ int main(int argc, char* argv[])
     MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
 
     // 2. Initial circular shift on A and B
-    int dst, src, shift, datatag = 0;
+    int dst, src, shift, datatag;
+    // The shift formula here is different from the 2.5D paper, but it works...
     shift = i + k * nproc_ij / c;
     if (shift > 0) 
     {
+        datatag = 0;
         dst = (j + c * nproc_ij - shift) % nproc_ij;
         src = (j + shift) % nproc_ij;
-
         MPI_Sendrecv_replace(
             A, local_bs, MPI_DOUBLE, dst, datatag, 
             src, datatag, row_comm, &status
@@ -100,9 +102,9 @@ int main(int argc, char* argv[])
     shift = j + k * nproc_ij / c;
     if (shift > 0) 
     {
+        datatag = 1;
         dst = (i + c * nproc_ij - shift) % nproc_ij;
         src = (i + shift) % nproc_ij;
-
         MPI_Sendrecv_replace(
             B, local_bs, MPI_DOUBLE, dst, datatag, 
             src, datatag, col_comm, &status
@@ -114,7 +116,7 @@ int main(int argc, char* argv[])
     cblas_dgemm(
         CblasRowMajor, CblasNoTrans, CblasNoTrans,
         n_local, n_local, n_local,
-        1, A, n_local, B, n_local, 0, C, n_local
+        1, A, n_local, B, n_local, 0, C0, n_local
     );
 
     // 4. Do nproc_ij / c steps of Cannon's algorithm
@@ -124,7 +126,7 @@ int main(int argc, char* argv[])
     int i_src = (i - 1 + nproc_ij) % nproc_ij; 
     for (int stage = 1; stage < nproc_ij / c; stage++) 
     {
-        datatag = stage;
+        datatag = stage + 1;
         
         // (1) Send A block to the right and receive a new from the left
         MPI_Sendrecv_replace(
@@ -142,13 +144,12 @@ int main(int argc, char* argv[])
         cblas_dgemm(
             CblasRowMajor, CblasNoTrans, CblasNoTrans,
             n_local, n_local, n_local,
-            1, A, n_local, B, n_local, 1, C, n_local
+            1, A, n_local, B, n_local, 1, C0, n_local
         );
     }
 
     // 5. Reduce sum the result to processes on plane 0
-    if (plane == 0) MPI_Reduce(MPI_IN_PLACE, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
-    else            MPI_Reduce(C, NULL, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
+    MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
 
     t1 = MPI_Wtime() - t0;
     double avg_t;
@@ -174,6 +175,7 @@ int main(int argc, char* argv[])
     mkl_free(A);
     mkl_free(B);
     mkl_free(C);
+    mkl_free(C0);
     
     MPI_Type_free(&subarrtype);
     MPI_Comm_free(&row_comm);
