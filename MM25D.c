@@ -6,7 +6,7 @@
 #include "mpi.h"
 #include "mkl.h"
 
-// #define VERIFY
+//#define VERIFY
 
 #include "utils.c"
 
@@ -92,8 +92,6 @@ int main(int argc, char **argv)
     
     for (int itest = 0; itest < ntest; itest++)
     {
-        memset(C0, 0, local_bs * sizeof(double));
-        memset(C , 0, local_bs * sizeof(double));
         MPI_Barrier(MPI_COMM_WORLD);
         
         st0 = MPI_Wtime();
@@ -187,6 +185,17 @@ int main(int argc, char **argv)
         
         et0 = MPI_Wtime();
         total_t += et0 - st0;
+        
+        #ifdef VERIFY
+        if (itest == 0)
+        {
+            gather_result(
+                root, my_rank, my_plane, n, nproc_ij, local_bs,
+                plane_comm, sendcounts, displs, subarrtype,
+                C, M, N, P
+            );
+        }
+        #endif
     }
     
     double GFlop = 2.0 * (double) n * (double) n * (double) n * (double) ntest / 1000000000.0;
@@ -210,14 +219,6 @@ int main(int argc, char **argv)
             printf("  * Overall       = %.2lf (s), %.2lf GFlops\n", avg_total_t, GFlop / avg_total_t);
         }
     }
-    
-    #ifdef VERIFY
-    gather_result(
-        root, my_rank, my_plane, n, nproc_ij, local_bs,
-        plane_comm, sendcounts, displs, subarrtype,
-        C, M, N, P
-    );
-    #endif
     
     free(sendcounts);
     free(displs);
