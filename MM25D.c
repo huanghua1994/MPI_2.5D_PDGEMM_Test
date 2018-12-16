@@ -3,10 +3,11 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <malloc.h>
 #include "mpi.h"
 #include "mkl.h"
 
-#define VERIFY
+//#define VERIFY
 
 #include "utils.c"
 
@@ -134,6 +135,11 @@ void MM25D_shift_dgemm_kernel(
 int main(int argc, char **argv) 
 {
     int root = 0;
+    
+    // Disable memory mapped malloc, previously done in MA_init() 
+    // for caching page registrations 
+    mallopt(M_MMAP_MAX, 0);
+    mallopt(M_TRIM_THRESHOLD, -1);
 
     MPI_Init(&argc, &argv);
     
@@ -190,14 +196,13 @@ int main(int argc, char **argv)
     double *M, *N, *P, *Q;
     if (0 == my_rank) initial_matrix(&M, &N, &P, &Q, n);
 
-    double *A  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *B  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *C  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *D  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *A0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *B0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *C0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *D0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *matbuf = (double *) mkl_malloc(6 * local_bs * sizeof(double), 16);
+    double *A  = matbuf + local_bs * 0;
+    double *B  = matbuf + local_bs * 1;
+    double *C  = matbuf + local_bs * 2;
+    double *D  = matbuf + local_bs * 3;
+    double *C0 = matbuf + local_bs * 4;
+    double *D0 = matbuf + local_bs * 5;
 
     // Scatter and Gather used data types
     MPI_Datatype subarrtype;
@@ -217,13 +222,13 @@ int main(int argc, char **argv)
     double comm_t = 0.0, reduce_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
     // Backup A & B since they will be changed after computing C := A * B
-    memcpy(A0, A, sizeof(double) * local_bs);
-    memcpy(B0, B, sizeof(double) * local_bs);
+    //memcpy(A0, A, sizeof(double) * local_bs);
+    //memcpy(B0, B, sizeof(double) * local_bs);
     
     for (int itest = 0; itest < ntest; itest++)
     {
-        memcpy(A, A0, sizeof(double) * local_bs);
-        memcpy(B, B0, sizeof(double) * local_bs);
+        //memcpy(A, A0, sizeof(double) * local_bs);
+        //memcpy(B, B0, sizeof(double) * local_bs);
         
         MPI_Barrier(MPI_COMM_WORLD);
         
@@ -250,25 +255,33 @@ int main(int argc, char **argv)
             A, B, C0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
         );
        
-        // 3.1 Allreduce sum C in dup_comm (== Reduce + Bcast)
+        // 3 Reduce sum C to plane 0
         st1 = MPI_Wtime();
         for (int ii = 0; ii < N_DUP; ii++)
-            MPI_Iallreduce(C0 + spos[ii], C + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, dup_comms[ii], &reqs[ii]);
+            MPI_Ireduce(C0 + spos[ii], C + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, 0, dup_comms[ii], &reqs[ii]);
         MPI_Waitall(N_DUP, &reqs[0], &status[0]);
         et1 = MPI_Wtime();
         reduce_t += et1 - st1;
         
-        // 3.2 Backup C and Recover A
+        // 4.1 Replicate C on each plane
+        st1 = MPI_Wtime();
+        for (int ii = 0; ii < N_DUP; ii++)
+            MPI_Ibcast(C + spos[ii], blklen[ii], MPI_DOUBLE, 0, dup_comms[ii], &reqs[ii]);
+        MPI_Waitall(N_DUP, &reqs[0], &status[0]);
+        et1 = MPI_Wtime();
+        comm_t += et1 - st1;
+        
+        // 4.2 Backup C and Recover A
         memcpy(C0, C, sizeof(double) * local_bs);
         memcpy(A, D0, sizeof(double) * local_bs);
         
-        // 4. Do nproc_ij/c steps of Canon's algorithm
+        // 5. Do nproc_ij/c steps of Canon's algorithm
         MM25D_shift_dgemm_kernel(
             i, j, k, nproc_ij, c, n_local, local_bs,
             A, C0, D0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
         );
        
-        // 5. Reduce sum C to processes on plane 0
+        // 6. Reduce sum C to processes on plane 0
         st1 = MPI_Wtime();
         for (int ii = 0; ii < N_DUP; ii++)
             MPI_Ireduce(D0 + spos[ii], D + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, 0, dup_comms[ii], &reqs[ii]);
@@ -317,14 +330,7 @@ int main(int argc, char **argv)
     
     free(sendcounts);
     free(displs);
-    mkl_free(A);
-    mkl_free(B);
-    mkl_free(C);
-    mkl_free(D);
-    mkl_free(A0);
-    mkl_free(B0);
-    mkl_free(C0);
-    mkl_free(D0);
+    mkl_free(matbuf);
     
     MPI_Type_free(&subarrtype);
     MPI_Comm_free(&row_comm);
