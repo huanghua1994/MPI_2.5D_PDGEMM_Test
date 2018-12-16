@@ -10,6 +10,94 @@
 
 #include "utils.c"
 
+void MM25D_shift_dgemm_kernel(
+    int i, int j, int k, int nproc_ij, int c, 
+    int n_local, int local_bs,
+    double *A, double *B, double *C,
+    MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm,
+    double *comm_t, double *dgemm_t
+)
+{
+    MPI_Status status;
+    double st1, et1;
+    
+    // (1) Initial circular shift on A and B
+    int dst, src, shift, datatag;
+    st1 = MPI_Wtime();
+    // The shift formula here is different from the 2.5D paper, but it works...
+    shift = i + k * nproc_ij / c;
+    if (shift > 0) 
+    {
+        datatag = 0;
+        dst = (j + c * nproc_ij - shift) % nproc_ij;
+        src = (j + shift) % nproc_ij;
+        MPI_Sendrecv_replace(
+            A, local_bs, MPI_DOUBLE, dst, datatag, 
+            src, datatag, row_comm, &status
+        );
+    }
+    shift = j + k * nproc_ij / c;
+    if (shift > 0) 
+    {
+        datatag = 1;
+        dst = (i + c * nproc_ij - shift) % nproc_ij;
+        src = (i + shift) % nproc_ij;
+        MPI_Sendrecv_replace(
+            B, local_bs, MPI_DOUBLE, dst, datatag, 
+            src, datatag, col_comm, &status
+        );
+    }
+    et1 = MPI_Wtime();
+    comm_t[0] += et1 - st1;
+    
+    // (2) Initial local DGEMM
+    st1 = MPI_Wtime();
+    cblas_dgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        n_local, n_local, n_local,
+        1, A, n_local, B, n_local, 0, C, n_local
+    );
+    et1 = MPI_Wtime();
+    dgemm_t[0] += et1 - st1;
+
+    // (3) Do nproc_ij / c steps of Cannon's algorithm
+    int j_dst = (j + 1) % nproc_ij;
+    int i_dst = (i + 1) % nproc_ij; 
+    int j_src = (j - 1 + nproc_ij) % nproc_ij;
+    int i_src = (i - 1 + nproc_ij) % nproc_ij; 
+    for (int stage = 1; stage < nproc_ij / c; stage++) 
+    {
+        datatag = stage + 1;
+        
+        st1 = MPI_Wtime();
+        
+        // Send A block to the right and receive a new from the left
+        MPI_Sendrecv_replace(
+            A, local_bs, MPI_DOUBLE, j_dst, datatag, 
+            j_src, datatag, row_comm, &status
+        );
+
+        // Send B block to the below and receive a new from the up
+        MPI_Sendrecv_replace(
+            B, local_bs, MPI_DOUBLE, i_dst, datatag, 
+            i_src, datatag, col_comm, &status
+        );
+        
+        et1 = MPI_Wtime();
+        comm_t[0] += et1 - st1;
+        
+        // Local DGEMM
+        st1 = MPI_Wtime();
+        cblas_dgemm(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            n_local, n_local, n_local,
+            1, A, n_local, B, n_local, 1, C, n_local
+        );
+        et1 = MPI_Wtime();
+        dgemm_t[0] += et1 - st1;
+    }
+}
+
 int main(int argc, char **argv) 
 {
     int root = 0;
@@ -23,9 +111,9 @@ int main(int argc, char **argv)
     int n = get_problem_size(argc, argv, nproc_ij, my_rank);
     int n_local = n / nproc_ij;
     int local_bs = n_local * n_local;
-    int ntest;
+    int ntest = 10;
     if (argc >= 4) ntest = atoi(argv[3]);
-    if (ntest < 1 || ntest > 20) ntest = 10;
+    if (ntest < 1 || ntest > 50) ntest = 10;
     if (my_rank == 0) 
     {
         printf("Test settings:\n");
@@ -65,13 +153,17 @@ int main(int argc, char **argv)
     int plane;
     MPI_Comm_rank(dup_comm, &plane);
     
-    double *M, *N, *P;
-    if (0 == my_rank) initial_matrix(&M, &N, &P, n, n, n);
+    double *M, *N, *P, *Q;
+    if (0 == my_rank) initial_matrix(&M, &N, &P, &Q, n);
 
     double *A  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *B  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *C  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *D  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *A0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *B0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
     double *C0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *D0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
 
     // Scatter and Gather used data types
     MPI_Datatype subarrtype;
@@ -90,98 +182,56 @@ int main(int argc, char **argv)
     double st0, et0, st1, et1;
     double comm_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
+    // Backup A & B since they will be changed after computing C := A * B
+    memcpy(A0, A, sizeof(double) * local_bs);
+    memcpy(B0, B, sizeof(double) * local_bs);
+    
     for (int itest = 0; itest < ntest; itest++)
     {
+        memcpy(A, A0, sizeof(double) * local_bs);
+        memcpy(B, B0, sizeof(double) * local_bs);
+        
         MPI_Barrier(MPI_COMM_WORLD);
         
         st0 = MPI_Wtime();
-        st1 = MPI_Wtime();
         
-        // 1. Replicate input matrix on each plane
+        // 1.1 Replicate A & B on each plane
+        st1 = MPI_Wtime();
         MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
         MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
-        
-        // 2. Initial circular shift on A and B
-        int dst, src, shift, datatag;
-        // The shift formula here is different from the 2.5D paper, but it works...
-        shift = i + k * nproc_ij / c;
-        if (shift > 0) 
-        {
-            datatag = 0;
-            dst = (j + c * nproc_ij - shift) % nproc_ij;
-            src = (j + shift) % nproc_ij;
-            MPI_Sendrecv_replace(
-                A, local_bs, MPI_DOUBLE, dst, datatag, 
-                src, datatag, row_comm, &status
-            );
-        }
-        shift = j + k * nproc_ij / c;
-        if (shift > 0) 
-        {
-            datatag = 1;
-            dst = (i + c * nproc_ij - shift) % nproc_ij;
-            src = (i + shift) % nproc_ij;
-            MPI_Sendrecv_replace(
-                B, local_bs, MPI_DOUBLE, dst, datatag, 
-                src, datatag, col_comm, &status
-            );
-        }
-        
         et1 = MPI_Wtime();
         comm_t += et1 - st1;
         
-        // 3. Initial local DGEMM
-        st1 = MPI_Wtime();
-        cblas_dgemm(
-            CblasRowMajor, CblasNoTrans, CblasNoTrans,
-            n_local, n_local, n_local,
-            1, A, n_local, B, n_local, 0, C0, n_local
+        // 1.2 Backup the broadcast A, save a broadcast in D := A * C
+        memcpy(D0, A, sizeof(double) * local_bs);
+
+        // 2. Do nproc_ij/c steps of Canon's algorithm to get C := A * B
+        MM25D_shift_dgemm_kernel(
+            i, j, k, nproc_ij, c, n_local, local_bs,
+            A, B, C0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
         );
-        et1 = MPI_Wtime();
-        dgemm_t += et1 - st1;
-
-        // 4. Do nproc_ij / c steps of Cannon's algorithm
-        int j_dst = (j + 1) % nproc_ij;
-        int i_dst = (i + 1) % nproc_ij; 
-        int j_src = (j - 1 + nproc_ij) % nproc_ij;
-        int i_src = (i - 1 + nproc_ij) % nproc_ij; 
-        for (int stage = 1; stage < nproc_ij / c; stage++) 
-        {
-            datatag = stage + 1;
-            
-            st1 = MPI_Wtime();
-            
-            // (1) Send A block to the right and receive a new from the left
-            MPI_Sendrecv_replace(
-                A, local_bs, MPI_DOUBLE, j_dst, datatag, 
-                j_src, datatag, row_comm, &status
-            );
-
-            // (2) Send B block to the below and receive a new from the up
-            MPI_Sendrecv_replace(
-                B, local_bs, MPI_DOUBLE, i_dst, datatag, 
-                i_src, datatag, col_comm, &status
-            );
-            
-            et1 = MPI_Wtime();
-            comm_t += et1 - st1;
-            
-            // (3) Local DGEMM
-            st1 = MPI_Wtime();
-            cblas_dgemm(
-                CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                n_local, n_local, n_local,
-                1, A, n_local, B, n_local, 1, C0, n_local
-            );
-            et1 = MPI_Wtime();
-            dgemm_t += et1 - st1;
-        }
-
-        // 5. Reduce sum the result to processes on plane 0
+       
+        // 3.1 Allreduce sum C in dup_comm (== Reduce + Bcast)
         st1 = MPI_Wtime();
-        MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
+        MPI_Allreduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, dup_comm);
         et1 = MPI_Wtime();
-        dgemm_t += et1 - st1;
+        comm_t += et1 - st1;
+        
+        // 3.2 Backup C and Recover A
+        memcpy(C0, C, sizeof(double) * local_bs);
+        memcpy(A, D0, sizeof(double) * local_bs);
+        
+        // 4. Do nproc_ij/c steps of Canon's algorithm
+        MM25D_shift_dgemm_kernel(
+            i, j, k, nproc_ij, c, n_local, local_bs,
+            A, C0, D0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
+        );
+       
+        // 5. Reduce sum C to processes on plane 0
+        st1 = MPI_Wtime();
+        MPI_Reduce(D0, D, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
+        et1 = MPI_Wtime();
+        comm_t += et1 - st1;
         
         et0 = MPI_Wtime();
         total_t += et0 - st0;
@@ -192,13 +242,13 @@ int main(int argc, char **argv)
             gather_result(
                 root, my_rank, my_plane, n, nproc_ij, local_bs,
                 plane_comm, sendcounts, displs, subarrtype,
-                C, M, N, P
+                C, D, M, N, P, Q
             );
         }
         #endif
     }
     
-    double GFlop = 2.0 * (double) n * (double) n * (double) n * (double) ntest / 1000000000.0;
+    double GFlop = 4.0 * (double) n * (double) n * (double) n * (double) ntest / 1000000000.0;
     
     double avg_comm_t, avg_dgemm_t, avg_total_t;
     
@@ -225,7 +275,11 @@ int main(int argc, char **argv)
     mkl_free(A);
     mkl_free(B);
     mkl_free(C);
+    mkl_free(D);
+    mkl_free(A0);
+    mkl_free(B0);
     mkl_free(C0);
+    mkl_free(D0);
     
     MPI_Type_free(&subarrtype);
     MPI_Comm_free(&row_comm);

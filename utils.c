@@ -97,35 +97,62 @@ void init_subarrtype(
     }
 }
 
-void initial_matrix(double **A_addr, double **B_addr, double **C_addr, int m, int n, int k) 
+void initial_matrix(double **A_addr, double **B_addr, double **C_addr, double **D_addr, int n) 
 {
-    double* A = (double *) mkl_malloc(m * k * sizeof(double), 16);
-    double* B = (double *) mkl_malloc(n * k * sizeof(double), 16);
-    double* C = (double *) mkl_malloc(m * n * sizeof(double), 16);
+    double *A = (double *) mkl_malloc(n * n * sizeof(double), 16);
+    double *B = (double *) mkl_malloc(n * n * sizeof(double), 16);
+    double *C = (double *) mkl_malloc(n * n * sizeof(double), 16);
+    double *D = (double *) mkl_malloc(n * n * sizeof(double), 16);
     *A_addr = A;
     *B_addr = B;
     *C_addr = C;
+    *D_addr = D;
     
     srand(time(NULL));
-    double RMAX = (double) RAND_MAX;
-    for (int i = 0; i < m * k; i++) A[i] = (double) rand() / RMAX;
-    for (int i = 0; i < k * n; i++) B[i] = (double) rand() / RMAX;
+    int rand0 = rand() % 1000;
+    double rand_0 = (double) rand() / (double) RAND_MAX;
+    for (int i = 0; i < n; i++)
+    {
+        int offset = i * n;
+        for (int j = 0; j < n; j++)
+        {
+            A[offset + j] = (double) ((i + j) % 1000) + rand_0;
+            B[offset + j] = A[offset + j];
+        }
+    }
 }
 
-int check_result(double *A, double *B, double *C, int m, int n, int k) 
+int check_result(double *A, double *B, double *C, double *D, int n) 
 {
     int err_counts = 0;
-    double *C_ref = (double *) mkl_malloc(m * n * sizeof(double), 16);
+    double *C_ref = (double *) mkl_malloc(n * n * sizeof(double), 16);
+    double *D_ref = (double *) mkl_malloc(n * n * sizeof(double), 16);
     
     cblas_dgemm(
         CblasRowMajor, CblasNoTrans, CblasNoTrans,
-        m, n, k, 1.0, A, k, B, k, 0.0, C_ref, n
+        n, n, n, 1.0, A, n, B, n, 0.0, C_ref, n
+    );
+    cblas_dgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        n, n, n, 1.0, A, n, C_ref, n, 0.0, D_ref, n
     );
 
-    for (int i = 0; i < m * n; i++) 
-        err_counts += (fabs(C[i] - C_ref[i]) < 0.0001 ? 0 : 1);
+    for (int i = 0; i < n * n; i++) 
+    {
+        double diff = C[i] - C_ref[i];
+        double rel_diff = fabs(diff / C_ref[i]);
+        if (rel_diff > 1e-10) err_counts++;
+    }
+    
+    for (int i = 0; i < n * n; i++) 
+    {
+        double diff = D[i] - D_ref[i];
+        double rel_diff = fabs(diff / D_ref[i]);
+        if (rel_diff > 1e-10) err_counts++;
+    }
 
     mkl_free(C_ref);
+    mkl_free(D_ref);
     
     return err_counts;
 }
@@ -154,7 +181,7 @@ void scatter_data(
 void gather_result(
     int root, int my_rank, int my_plane, int n, int nproc_ij, int local_bs,
     MPI_Comm plane_comm, int *sendcounts,  int *displs, MPI_Datatype subarrtype,
-    double *C, double *M, double *N, double *P
+    double *C, double *D, double *M, double *N, double *P, double *Q
 ) 
 {
     if (my_plane == 0) 
@@ -163,11 +190,15 @@ void gather_result(
             C, local_bs,  MPI_DOUBLE, P, 
             sendcounts, displs, subarrtype, root, plane_comm
         );
+        MPI_Gatherv(
+            D, local_bs,  MPI_DOUBLE, Q, 
+            sendcounts, displs, subarrtype, root, plane_comm
+        );
     }
 
     if (my_rank == root) 
     {
-        int err_counts = check_result(M, N, P, n, n, n); 
+        int err_counts = check_result(M, N, P, Q, n); 
         if (err_counts) 
         {
             fprintf(stderr, "Check failed: %d errors\n", err_counts);
