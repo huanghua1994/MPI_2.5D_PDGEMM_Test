@@ -180,7 +180,7 @@ int main(int argc, char **argv)
     MPI_Barrier(cart_comm);
     
     double st0, et0, st1, et1;
-    double comm_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
+    double comm_t = 0.0, reduce_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
     // Backup A & B since they will be changed after computing C := A * B
     memcpy(A0, A, sizeof(double) * local_bs);
@@ -198,7 +198,8 @@ int main(int argc, char **argv)
         // 1.1 Replicate A & B on each plane
         st1 = MPI_Wtime();
         MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
-        MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
+        //MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
+        memcpy(B, A, sizeof(double) * local_bs);  // A == B
         et1 = MPI_Wtime();
         comm_t += et1 - st1;
         
@@ -215,7 +216,7 @@ int main(int argc, char **argv)
         st1 = MPI_Wtime();
         MPI_Allreduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, dup_comm);
         et1 = MPI_Wtime();
-        comm_t += et1 - st1;
+        reduce_t += et1 - st1;
         
         // 3.2 Backup C and Recover A
         memcpy(C0, C, sizeof(double) * local_bs);
@@ -231,7 +232,7 @@ int main(int argc, char **argv)
         st1 = MPI_Wtime();
         MPI_Reduce(D0, D, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
         et1 = MPI_Wtime();
-        comm_t += et1 - st1;
+        reduce_t += et1 - st1;
         
         et0 = MPI_Wtime();
         total_t += et0 - st0;
@@ -250,23 +251,25 @@ int main(int argc, char **argv)
     
     double GFlop = 4.0 * (double) n * (double) n * (double) n * (double) ntest / 1000000000.0;
     
-    double avg_comm_t, avg_dgemm_t, avg_total_t;
+    double avg_comm_t, avg_reduce_t, avg_dgemm_t, avg_total_t;
     
     if (my_plane == 0) 
     {
-        MPI_Reduce(&comm_t,  &avg_comm_t,  1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&dgemm_t, &avg_dgemm_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&total_t, &avg_total_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        avg_comm_t  /= (double) (nproc_ij * nproc_ij);
-        avg_dgemm_t /= (double) (nproc_ij * nproc_ij);
-        avg_total_t /= (double) (nproc_ij * nproc_ij);
+        MPI_Reduce(&comm_t,   &avg_comm_t,   1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&reduce_t, &avg_reduce_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&dgemm_t,  &avg_dgemm_t,  1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&total_t,  &avg_total_t,  1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        avg_comm_t    /= (double) (nproc_ij * nproc_ij);
+        avg_reduce_t  /= (double) (nproc_ij * nproc_ij);
+        avg_dgemm_t   /= (double) (nproc_ij * nproc_ij);
+        avg_total_t   /= (double) (nproc_ij * nproc_ij);
         
         if (my_rank == root) 
         {
             printf("PDGEMM 2.5D algorithm %d runs average timing:\n", ntest);
-            printf("  * Communication = %.2lf (s)\n", avg_comm_t);
-            printf("  * Local DGEMM   = %.2lf (s), %.2lf GFlops\n", avg_dgemm_t, GFlop / avg_dgemm_t);
-            printf("  * Overall       = %.2lf (s), %.2lf GFlops\n", avg_total_t, GFlop / avg_total_t);
+            printf("  * Comm / Reduce / Total = %.2lf / %.2lf / %.2lf (s)\n", avg_comm_t, avg_reduce_t, avg_comm_t + avg_reduce_t);
+            printf("  * Local DGEMM = %.2lf (s), %.2lf GFlops\n", avg_dgemm_t, GFlop / avg_dgemm_t);
+            printf("  * Overall = %.2lf (s), %.2lf GFlops\n", avg_total_t, GFlop / avg_total_t);
         }
     }
     
