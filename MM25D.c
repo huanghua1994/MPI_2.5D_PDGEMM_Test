@@ -6,9 +6,42 @@
 #include "mpi.h"
 #include "mkl.h"
 
-//#define VERIFY
+#define VERIFY
 
 #include "utils.c"
+
+#define N_DUP    4
+MPI_Comm    row_comms[N_DUP], col_comms[N_DUP], dup_comms[N_DUP];
+MPI_Status  status[N_DUP];
+MPI_Request reqs[N_DUP], reqs0[N_DUP];
+int spos[N_DUP + 1], blklen[N_DUP];
+int row_spos[N_DUP + 1], row_blklen[N_DUP];
+
+void duplicate_comms(MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm, int nrow, int ncol)
+{    
+    int remainder  = nrow % N_DUP;
+    int block_size = nrow / N_DUP;
+    for (int i = 0; i < remainder; i++)
+    {
+        row_blklen[i] = block_size + 1;
+        blklen[i] = row_blklen[i] * ncol;
+    }
+    for (int i = remainder; i < N_DUP; i++)
+    {
+        row_blklen[i] = block_size;
+        blklen[i] = row_blklen[i] * ncol;
+    }
+    
+    row_spos[0] = spos[0] = 0;
+    for (int i = 0; i < N_DUP; i++)
+    {
+        MPI_Comm_dup(row_comm, &row_comms[i]);
+        MPI_Comm_dup(col_comm, &col_comms[i]);
+        MPI_Comm_dup(dup_comm, &dup_comms[i]);
+        spos[i + 1] = spos[i] + blklen[i];
+        row_spos[i + 1] = row_spos[i] + row_blklen[i];
+    }
+}
 
 void MM25D_shift_dgemm_kernel(
     int i, int j, int k, int nproc_ij, int c, 
@@ -101,7 +134,6 @@ void MM25D_shift_dgemm_kernel(
 int main(int argc, char **argv) 
 {
     int root = 0;
-    MPI_Status status; 
 
     MPI_Init(&argc, &argv);
     
@@ -149,6 +181,8 @@ int main(int argc, char **argv)
     MPI_Cart_sub(cart_comm, remain_i,  &col_comm);
     MPI_Cart_sub(cart_comm, remain_k,  &dup_comm);
     MPI_Cart_sub(cart_comm, remain_ij, &plane_comm);
+    
+    duplicate_comms(row_comm, col_comm, dup_comm, n_local, n_local);
 
     int plane;
     MPI_Comm_rank(dup_comm, &plane);
@@ -197,9 +231,13 @@ int main(int argc, char **argv)
         
         // 1.1 Replicate A & B on each plane
         st1 = MPI_Wtime();
-        MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
-        //MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
-        memcpy(B, A, sizeof(double) * local_bs);  // A == B
+        for (int ii = 0; ii < N_DUP; ii++)
+            MPI_Ibcast(A + spos[ii], blklen[ii], MPI_DOUBLE, 0, dup_comms[ii], &reqs[ii]);
+        for (int ii = 0; ii < N_DUP; ii++)
+        {
+            MPI_Wait(&reqs[ii], &status[ii]);  
+            memcpy(B + spos[ii], A + spos[ii], sizeof(double) * blklen[ii]);  // A == B
+        }
         et1 = MPI_Wtime();
         comm_t += et1 - st1;
         
@@ -214,7 +252,9 @@ int main(int argc, char **argv)
        
         // 3.1 Allreduce sum C in dup_comm (== Reduce + Bcast)
         st1 = MPI_Wtime();
-        MPI_Allreduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, dup_comm);
+        for (int ii = 0; ii < N_DUP; ii++)
+            MPI_Iallreduce(C0 + spos[ii], C + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, dup_comms[ii], &reqs[ii]);
+        MPI_Waitall(N_DUP, &reqs[0], &status[0]);
         et1 = MPI_Wtime();
         reduce_t += et1 - st1;
         
@@ -230,7 +270,9 @@ int main(int argc, char **argv)
        
         // 5. Reduce sum C to processes on plane 0
         st1 = MPI_Wtime();
-        MPI_Reduce(D0, D, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
+        for (int ii = 0; ii < N_DUP; ii++)
+            MPI_Ireduce(D0 + spos[ii], D + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, 0, dup_comms[ii], &reqs[ii]);
+        MPI_Waitall(N_DUP, &reqs[0], &status[0]);
         et1 = MPI_Wtime();
         reduce_t += et1 - st1;
         
