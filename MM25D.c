@@ -44,12 +44,12 @@ void duplicate_comms(MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm, in
     }
 }
 
-void MM25D_shift_dgemm_kernel(
+void MM25D_Cannon_steps(
     int i, int j, int k, int nproc_ij, int c, 
     int n_local, int local_bs,
     double *A, double *B, double *A0, double *B0, double *C,
     MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm,
-    double *comm_t, double *dgemm_t
+    double *p2p_t, double *dgemm_t
 )
 {
     MPI_Status status;
@@ -75,7 +75,7 @@ void MM25D_shift_dgemm_kernel(
     MPI_Wait(&req1, &sta1); 
     
     et1 = MPI_Wtime();
-    comm_t[0] += et1 - st1;
+    p2p_t[0] += et1 - st1;
     
     // (2) Initial local DGEMM
     st1 = MPI_Wtime();
@@ -113,7 +113,7 @@ void MM25D_shift_dgemm_kernel(
         MPI_Wait(&req1, &sta1);
         
         et1 = MPI_Wtime();
-        comm_t[0] += et1 - st1;
+        p2p_t[0] += et1 - st1;
         
         // Local DGEMM
         st1 = MPI_Wtime();
@@ -219,7 +219,7 @@ int main(int argc, char **argv)
     MPI_Barrier(cart_comm);
     
     double st0, et0, st1, et1;
-    double comm_t = 0.0, reduce_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
+    double p2p_t = 0.0, bcast_t, reduce_t = 0.0, allreduce_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
     // Backup A & B since they will be changed after computing C := A * B
     //memcpy(A0, A, sizeof(double) * local_bs);
@@ -245,41 +245,38 @@ int main(int argc, char **argv)
             memcpy(B + spos[ii], A + spos[ii], sizeof(double) * blklen[ii]);  // A == B
         }
         et1 = MPI_Wtime();
-        comm_t += et1 - st1;
+        bcast_t += et1 - st1;
         
         // 1.2 Backup the broadcast A, save a broadcast in D := A * C
         memcpy(D0, A, sizeof(double) * local_bs);
 
         // 2. Do nproc_ij/c steps of Canon's algorithm to get C := A * B
-        MM25D_shift_dgemm_kernel(
+        MM25D_Cannon_steps(
             i, j, k, nproc_ij, c, n_local, local_bs, A, B, A0, B0, 
-            C0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
+            C0, row_comm, col_comm, dup_comm, &p2p_t, &dgemm_t
         );
        
         // 3 Reduce sum C to plane 0
         st1 = MPI_Wtime();
         for (int ii = 0; ii < N_DUP; ii++)
             MPI_Ireduce(C0 + spos[ii], C + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, 0, dup_comms[ii], &reqs[ii]);
-        MPI_Waitall(N_DUP, &reqs[0], &status[0]);
-        et1 = MPI_Wtime();
-        reduce_t += et1 - st1;
-        
-        // 4.1 Replicate C on each plane
-        st1 = MPI_Wtime();
         for (int ii = 0; ii < N_DUP; ii++)
+        {
+            MPI_Wait(&reqs[ii], &status[ii]);
             MPI_Ibcast(C + spos[ii], blklen[ii], MPI_DOUBLE, 0, dup_comms[ii], &reqs[ii]);
+        }
         MPI_Waitall(N_DUP, &reqs[0], &status[0]);
         et1 = MPI_Wtime();
-        comm_t += et1 - st1;
+        allreduce_t += et1 - st1;
         
         // 4.2 Backup C and Recover A
         memcpy(C0, C, sizeof(double) * local_bs);
         memcpy(A, D0, sizeof(double) * local_bs);
         
         // 5. Do nproc_ij/c steps of Canon's algorithm
-        MM25D_shift_dgemm_kernel(
+        MM25D_Cannon_steps(
             i, j, k, nproc_ij, c, n_local, local_bs, A, C0, A0, B0, 
-            D0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
+            D0, row_comm, col_comm, dup_comm, &p2p_t, &dgemm_t
         );
        
         // 6. Reduce sum C to processes on plane 0
@@ -307,25 +304,35 @@ int main(int argc, char **argv)
     
     double GFlop = 4.0 * (double) n * (double) n * (double) n * (double) ntest / 1000000000.0;
     
-    double avg_comm_t, avg_reduce_t, avg_dgemm_t, avg_total_t;
-    
     if (my_plane == 0) 
     {
-        MPI_Reduce(&comm_t,   &avg_comm_t,   1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&reduce_t, &avg_reduce_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&dgemm_t,  &avg_dgemm_t,  1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&total_t,  &avg_total_t,  1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        avg_comm_t    /= (double) (nproc_ij * nproc_ij);
-        avg_reduce_t  /= (double) (nproc_ij * nproc_ij);
-        avg_dgemm_t   /= (double) (nproc_ij * nproc_ij);
-        avg_total_t   /= (double) (nproc_ij * nproc_ij);
+        double avg_p2p_t, avg_bcast_t, avg_reduce_t, avg_allreduce_t, avg_dgemm_t, avg_total_t, avg_comm_t, nproj_ij2;
+        MPI_Reduce(&p2p_t,       &avg_p2p_t,       1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&bcast_t,     &avg_bcast_t,     1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&allreduce_t, &avg_allreduce_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&reduce_t,    &avg_reduce_t,    1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&dgemm_t,     &avg_dgemm_t,     1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        MPI_Reduce(&total_t,     &avg_total_t,     1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        nproj_ij2 = (double) (nproc_ij * nproc_ij);
+        avg_p2p_t       /= nproj_ij2;
+        avg_bcast_t     /= nproj_ij2;
+        avg_allreduce_t /= nproj_ij2;
+        avg_reduce_t    /= nproj_ij2;
+        avg_dgemm_t     /= nproj_ij2;
+        avg_total_t     /= nproj_ij2;
+        avg_comm_t = avg_p2p_t + avg_bcast_t + avg_allreduce_t + avg_reduce_t;
         
         if (my_rank == root) 
         {
             printf("PDGEMM 2.5D algorithm %d runs average timing:\n", ntest);
-            printf("  * Comm / Reduce / Total = %.2lf / %.2lf / %.2lf (s)\n", avg_comm_t, avg_reduce_t, avg_comm_t + avg_reduce_t);
-            printf("  * Local DGEMM = %.2lf (s), %.2lf GFlops\n", avg_dgemm_t, GFlop / avg_dgemm_t);
-            printf("  * Overall = %.2lf (s), %.2lf GFlops\n", avg_total_t, GFlop / avg_total_t);
+            printf("  Communication time:\n");
+            printf("    * P2P        : %.2lf (s)\n", avg_p2p_t);
+            printf("    * Bcast      : %.2lf (s)\n", avg_bcast_t);
+            printf("    * Allreduce  : %.2lf (s)\n", avg_allreduce_t);
+            printf("    * Reduce     : %.2lf (s)\n", avg_reduce_t);
+            printf("    * Total      : %.2lf (s)\n", avg_comm_t);
+            printf("  Local DGEMM = %.2lf (s), %.2lf GFlops\n", avg_dgemm_t, GFlop / avg_dgemm_t);
+            printf("  Overall = %.2lf (s), %.2lf GFlops\n", avg_total_t, GFlop / avg_total_t);
         }
     }
     
