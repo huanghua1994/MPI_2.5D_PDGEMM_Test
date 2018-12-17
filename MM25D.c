@@ -6,7 +6,7 @@
 #include "mpi.h"
 #include "mkl.h"
 
-//#define VERIFY
+#define VERIFY
 
 #include "utils.c"
 
@@ -95,37 +95,28 @@ int main(int argc, char **argv)
         MPI_Barrier(MPI_COMM_WORLD);
         
         st0 = MPI_Wtime();
-        st1 = MPI_Wtime();
+        
         
         // 1. Replicate input matrix on each plane
+        st1 = MPI_Wtime();
         MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
         MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
         
         // 2. Initial circular shift on A and B
         int dst, src, shift, datatag;
-        // The shift formula here is different from the 2.5D paper, but it works...
-        shift = i + k * nproc_ij / c;
-        if (shift > 0) 
-        {
-            datatag = 0;
-            dst = (j + c * nproc_ij - shift) % nproc_ij;
-            src = (j + shift) % nproc_ij;
-            MPI_Sendrecv_replace(
-                A, local_bs, MPI_DOUBLE, dst, datatag, 
-                src, datatag, row_comm, &status
-            );
-        }
-        shift = j + k * nproc_ij / c;
-        if (shift > 0) 
-        {
-            datatag = 1;
-            dst = (i + c * nproc_ij - shift) % nproc_ij;
-            src = (i + shift) % nproc_ij;
-            MPI_Sendrecv_replace(
-                B, local_bs, MPI_DOUBLE, dst, datatag, 
-                src, datatag, col_comm, &status
-            );
-        }
+        MPI_Status sta0, sta1;
+        MPI_Request req0, req1, req2;
+        memcpy(C, A, local_bs * sizeof(double));
+        memcpy(C0, B, local_bs * sizeof(double));
+        shift = k * (nproc_ij / c);
+        int SA = (j - i + shift + c * nproc_ij) % nproc_ij;
+        int SB = (i - j + shift + c * nproc_ij) % nproc_ij;
+        MPI_Isend(C,  local_bs, MPI_DOUBLE, SA, 0, row_comm, &req2);
+        MPI_Isend(C0, local_bs, MPI_DOUBLE, SB, 1, col_comm, &req2);
+        MPI_Irecv(A,  local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 0, row_comm, &req0);
+        MPI_Irecv(B,  local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 1, col_comm, &req1);
+        MPI_Wait(&req0, &sta0);
+        MPI_Wait(&req1, &sta1);
         
         et1 = MPI_Wtime();
         comm_t += et1 - st1;
