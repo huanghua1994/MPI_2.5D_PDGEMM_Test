@@ -47,7 +47,7 @@ void duplicate_comms(MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm, in
 void MM25D_shift_dgemm_kernel(
     int i, int j, int k, int nproc_ij, int c, 
     int n_local, int local_bs,
-    double *A, double *B, double *C,
+    double *A, double *B, double *A0, double *B0, double *C,
     MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm,
     double *comm_t, double *dgemm_t
 )
@@ -55,32 +55,25 @@ void MM25D_shift_dgemm_kernel(
     MPI_Status status;
     double st1, et1;
     
+    double *sendA, *recvA, *sendB, *recvB, *tmpptr;
+    MPI_Status sta0, sta1;
+    MPI_Request req0, req1, req2;
+    
+    sendA = A;  recvA = A0;
+    sendB = B;  recvB = B0;
+    
     // (1) Initial circular shift on A and B
-    int dst, src, shift, datatag;
     st1 = MPI_Wtime();
-    // The shift formula here is different from the 2.5D paper, but it works...
-    shift = i + k * nproc_ij / c;
-    if (shift > 0) 
-    {
-        datatag = 0;
-        dst = (j + c * nproc_ij - shift) % nproc_ij;
-        src = (j + shift) % nproc_ij;
-        MPI_Sendrecv_replace(
-            A, local_bs, MPI_DOUBLE, dst, datatag, 
-            src, datatag, row_comm, &status
-        );
-    }
-    shift = j + k * nproc_ij / c;
-    if (shift > 0) 
-    {
-        datatag = 1;
-        dst = (i + c * nproc_ij - shift) % nproc_ij;
-        src = (i + shift) % nproc_ij;
-        MPI_Sendrecv_replace(
-            B, local_bs, MPI_DOUBLE, dst, datatag, 
-            src, datatag, col_comm, &status
-        );
-    }
+    int shift = k * (nproc_ij / c);
+    int dstA = (j - i + shift + c * nproc_ij) % nproc_ij;
+    int dstB = (i - j + shift + c * nproc_ij) % nproc_ij;
+    MPI_Isend(sendA, local_bs, MPI_DOUBLE, dstA, 0, row_comm, &req2);
+    MPI_Isend(sendB, local_bs, MPI_DOUBLE, dstB, 1, col_comm, &req2);
+    MPI_Irecv(recvA, local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 0, row_comm, &req0);
+    MPI_Irecv(recvB, local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 1, col_comm, &req1);
+    MPI_Wait(&req0, &sta0);
+    MPI_Wait(&req1, &sta1); 
+    
     et1 = MPI_Wtime();
     comm_t[0] += et1 - st1;
     
@@ -89,11 +82,14 @@ void MM25D_shift_dgemm_kernel(
     cblas_dgemm(
         CblasRowMajor, CblasNoTrans, CblasNoTrans,
         n_local, n_local, n_local,
-        1, A, n_local, B, n_local, 0, C, n_local
+        1, recvA, n_local, recvB, n_local, 0, C, n_local
     );
     et1 = MPI_Wtime();
     dgemm_t[0] += et1 - st1;
 
+    tmpptr = sendA; sendA = recvA; recvA = tmpptr;
+    tmpptr = sendB; sendB = recvB; recvB = tmpptr;
+    
     // (3) Do nproc_ij / c steps of Cannon's algorithm
     int j_dst = (j + 1) % nproc_ij;
     int i_dst = (i + 1) % nproc_ij; 
@@ -101,21 +97,20 @@ void MM25D_shift_dgemm_kernel(
     int i_src = (i - 1 + nproc_ij) % nproc_ij; 
     for (int stage = 1; stage < nproc_ij / c; stage++) 
     {
-        datatag = stage + 1;
+        int datatag = stage + 1;
         
         st1 = MPI_Wtime();
         
         // Send A block to the right and receive a new from the left
-        MPI_Sendrecv_replace(
-            A, local_bs, MPI_DOUBLE, j_dst, datatag, 
-            j_src, datatag, row_comm, &status
-        );
+        MPI_Isend(sendA, local_bs, MPI_DOUBLE, j_dst, datatag, row_comm, &req2);
+        MPI_Irecv(recvA, local_bs, MPI_DOUBLE, j_src, datatag, row_comm, &req0);
 
         // Send B block to the below and receive a new from the up
-        MPI_Sendrecv_replace(
-            B, local_bs, MPI_DOUBLE, i_dst, datatag, 
-            i_src, datatag, col_comm, &status
-        );
+        MPI_Isend(sendB, local_bs, MPI_DOUBLE, i_dst, datatag, col_comm, &req2);
+        MPI_Irecv(recvB, local_bs, MPI_DOUBLE, i_src, datatag, col_comm, &req1);
+        
+        MPI_Wait(&req0, &sta0);
+        MPI_Wait(&req1, &sta1);
         
         et1 = MPI_Wtime();
         comm_t[0] += et1 - st1;
@@ -125,10 +120,13 @@ void MM25D_shift_dgemm_kernel(
         cblas_dgemm(
             CblasRowMajor, CblasNoTrans, CblasNoTrans,
             n_local, n_local, n_local,
-            1, A, n_local, B, n_local, 1, C, n_local
+            1, recvA, n_local, recvB, n_local, 1, C, n_local
         );
         et1 = MPI_Wtime();
         dgemm_t[0] += et1 - st1;
+        
+        tmpptr = sendA; sendA = recvA; recvA = tmpptr;
+        tmpptr = sendB; sendB = recvB; recvB = tmpptr;
     }
 }
 
@@ -196,13 +194,15 @@ int main(int argc, char **argv)
     double *M, *N, *P, *Q;
     if (0 == my_rank) initial_matrix(&M, &N, &P, &Q, n);
 
-    double *matbuf = (double *) mkl_malloc(6 * local_bs * sizeof(double), 16);
+    double *matbuf = (double *) mkl_malloc(8 * local_bs * sizeof(double), 16);
     double *A  = matbuf + local_bs * 0;
     double *B  = matbuf + local_bs * 1;
     double *C  = matbuf + local_bs * 2;
     double *D  = matbuf + local_bs * 3;
-    double *C0 = matbuf + local_bs * 4;
-    double *D0 = matbuf + local_bs * 5;
+    double *A0 = matbuf + local_bs * 4;  // A0 & B0 is used as a buffer for sendrecv
+    double *B0 = matbuf + local_bs * 5; 
+    double *C0 = matbuf + local_bs * 6;
+    double *D0 = matbuf + local_bs * 7;
 
     // Scatter and Gather used data types
     MPI_Datatype subarrtype;
@@ -227,6 +227,7 @@ int main(int argc, char **argv)
     
     for (int itest = 0; itest < ntest; itest++)
     {
+        // Recover the original A & B
         //memcpy(A, A0, sizeof(double) * local_bs);
         //memcpy(B, B0, sizeof(double) * local_bs);
         
@@ -251,8 +252,8 @@ int main(int argc, char **argv)
 
         // 2. Do nproc_ij/c steps of Canon's algorithm to get C := A * B
         MM25D_shift_dgemm_kernel(
-            i, j, k, nproc_ij, c, n_local, local_bs,
-            A, B, C0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
+            i, j, k, nproc_ij, c, n_local, local_bs, A, B, A0, B0, 
+            C0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
         );
        
         // 3 Reduce sum C to plane 0
@@ -277,8 +278,8 @@ int main(int argc, char **argv)
         
         // 5. Do nproc_ij/c steps of Canon's algorithm
         MM25D_shift_dgemm_kernel(
-            i, j, k, nproc_ij, c, n_local, local_bs,
-            A, C0, D0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
+            i, j, k, nproc_ij, c, n_local, local_bs, A, C0, A0, B0, 
+            D0, row_comm, col_comm, dup_comm, &comm_t, &dgemm_t
         );
        
         // 6. Reduce sum C to processes on plane 0
