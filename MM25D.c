@@ -68,10 +68,13 @@ int main(int argc, char **argv)
     double *M, *N, *P;
     if (0 == my_rank) initial_matrix(&M, &N, &P, n, n, n);
 
-    double *A  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *B  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *C  = (double *) mkl_malloc(local_bs * sizeof(double), 16);
-    double *C0 = (double *) mkl_malloc(local_bs * sizeof(double), 16);
+    double *matbuf = (double *) mkl_malloc(6 * local_bs * sizeof(double), 16);
+    double *A  = matbuf + local_bs * 0;
+    double *B  = matbuf + local_bs * 1;
+    double *C  = matbuf + local_bs * 2;
+    double *A0 = matbuf + local_bs * 3;
+    double *B0 = matbuf + local_bs * 4;
+    double *C0 = matbuf + local_bs * 5;
 
     // Scatter and Gather used data types
     MPI_Datatype subarrtype;
@@ -90,12 +93,13 @@ int main(int argc, char **argv)
     double st0, et0, st1, et1;
     double comm_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
+    double *sendA, *recvA, *sendB, *recvB, *tmpptr;
+    
     for (int itest = 0; itest < ntest; itest++)
     {
         MPI_Barrier(MPI_COMM_WORLD);
         
         st0 = MPI_Wtime();
-        
         
         // 1. Replicate input matrix on each plane
         st1 = MPI_Wtime();
@@ -106,15 +110,15 @@ int main(int argc, char **argv)
         int dst, src, shift, datatag;
         MPI_Status sta0, sta1;
         MPI_Request req0, req1, req2;
-        memcpy(C, A, local_bs * sizeof(double));
-        memcpy(C0, B, local_bs * sizeof(double));
+        sendA = A;  recvA = A0;
+        sendB = B;  recvB = B0;
         shift = k * (nproc_ij / c);
-        int SA = (j - i + shift + c * nproc_ij) % nproc_ij;
-        int SB = (i - j + shift + c * nproc_ij) % nproc_ij;
-        MPI_Isend(C,  local_bs, MPI_DOUBLE, SA, 0, row_comm, &req2);
-        MPI_Isend(C0, local_bs, MPI_DOUBLE, SB, 1, col_comm, &req2);
-        MPI_Irecv(A,  local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 0, row_comm, &req0);
-        MPI_Irecv(B,  local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 1, col_comm, &req1);
+        int dstA = (j - i + shift + c * nproc_ij) % nproc_ij;
+        int dstB = (i - j + shift + c * nproc_ij) % nproc_ij;
+        MPI_Isend(sendA, local_bs, MPI_DOUBLE, dstA, 0, row_comm, &req2);
+        MPI_Isend(sendB, local_bs, MPI_DOUBLE, dstB, 1, col_comm, &req2);
+        MPI_Irecv(recvA, local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 0, row_comm, &req0);
+        MPI_Irecv(recvB, local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 1, col_comm, &req1);
         MPI_Wait(&req0, &sta0);
         MPI_Wait(&req1, &sta1);
         
@@ -126,10 +130,13 @@ int main(int argc, char **argv)
         cblas_dgemm(
             CblasRowMajor, CblasNoTrans, CblasNoTrans,
             n_local, n_local, n_local,
-            1, A, n_local, B, n_local, 0, C0, n_local
+            1, recvA, n_local, recvB, n_local, 0, C0, n_local
         );
         et1 = MPI_Wtime();
         dgemm_t += et1 - st1;
+        
+        tmpptr = sendA; sendA = recvA; recvA = tmpptr;
+        tmpptr = sendB; sendB = recvB; recvB = tmpptr;
 
         // 4. Do nproc_ij / c steps of Cannon's algorithm
         int j_dst = (j + 1) % nproc_ij;
@@ -143,16 +150,15 @@ int main(int argc, char **argv)
             st1 = MPI_Wtime();
             
             // (1) Send A block to the right and receive a new from the left
-            MPI_Sendrecv_replace(
-                A, local_bs, MPI_DOUBLE, j_dst, datatag, 
-                j_src, datatag, row_comm, &status
-            );
+            MPI_Isend(sendA, local_bs, MPI_DOUBLE, j_dst, datatag, row_comm, &req2);
+            MPI_Irecv(recvA, local_bs, MPI_DOUBLE, j_src, datatag, row_comm, &req0);
 
             // (2) Send B block to the below and receive a new from the up
-            MPI_Sendrecv_replace(
-                B, local_bs, MPI_DOUBLE, i_dst, datatag, 
-                i_src, datatag, col_comm, &status
-            );
+            MPI_Isend(sendB, local_bs, MPI_DOUBLE, i_dst, datatag, col_comm, &req2);
+            MPI_Irecv(recvB, local_bs, MPI_DOUBLE, i_src, datatag, col_comm, &req1);
+            
+            MPI_Wait(&req0, &sta0);
+            MPI_Wait(&req1, &sta1);
             
             et1 = MPI_Wtime();
             comm_t += et1 - st1;
@@ -162,10 +168,13 @@ int main(int argc, char **argv)
             cblas_dgemm(
                 CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 n_local, n_local, n_local,
-                1, A, n_local, B, n_local, 1, C0, n_local
+                1, recvA, n_local, recvB, n_local, 1, C0, n_local
             );
             et1 = MPI_Wtime();
             dgemm_t += et1 - st1;
+            
+            tmpptr = sendA; sendA = recvA; recvA = tmpptr;
+            tmpptr = sendB; sendB = recvB; recvB = tmpptr;
         }
 
         // 5. Reduce sum the result to processes on plane 0
@@ -213,10 +222,7 @@ int main(int argc, char **argv)
     
     free(sendcounts);
     free(displs);
-    mkl_free(A);
-    mkl_free(B);
-    mkl_free(C);
-    mkl_free(C0);
+    mkl_free(matbuf);
     
     MPI_Type_free(&subarrtype);
     MPI_Comm_free(&row_comm);
