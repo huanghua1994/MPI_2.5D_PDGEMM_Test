@@ -219,7 +219,7 @@ int main(int argc, char **argv)
     MPI_Barrier(cart_comm);
     
     double st0, et0, st1, et1;
-    double p2p_t = 0.0, bcast_t, reduce_t = 0.0, allreduce_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
+    double p2p_t = 0.0, bcast_t = 0.0, reduce_t = 0.0, allreduce_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
     // Backup A & B since they will be changed after computing C := A * B
     //memcpy(A0, A, sizeof(double) * local_bs);
