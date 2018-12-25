@@ -12,13 +12,13 @@
 #include "utils.c"
 
 #define N_DUP    4
-MPI_Comm    row_comms[N_DUP], col_comms[N_DUP], dup_comms[N_DUP];
+MPI_Comm    dup_comms[N_DUP];
 MPI_Status  status[N_DUP];
 MPI_Request reqs[N_DUP], reqs0[N_DUP];
 int spos[N_DUP + 1], blklen[N_DUP];
 int row_spos[N_DUP + 1], row_blklen[N_DUP];
 
-void duplicate_comms(MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm, int nrow, int ncol)
+void duplicate_comms(MPI_Comm dup_comm, int nrow, int ncol)
 {    
     int remainder  = nrow % N_DUP;
     int block_size = nrow / N_DUP;
@@ -36,8 +36,6 @@ void duplicate_comms(MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm, in
     row_spos[0] = spos[0] = 0;
     for (int i = 0; i < N_DUP; i++)
     {
-        MPI_Comm_dup(row_comm, &row_comms[i]);
-        MPI_Comm_dup(col_comm, &col_comms[i]);
         MPI_Comm_dup(dup_comm, &dup_comms[i]);
         spos[i + 1] = spos[i] + blklen[i];
         row_spos[i + 1] = row_spos[i] + row_blklen[i];
@@ -48,7 +46,7 @@ void MM25D_Cannon_steps(
     int i, int j, int k, int nproc_ij, int c, 
     int n_local, int local_bs,
     double *A, double *B, double *A0, double *B0, double *C,
-    MPI_Comm row_comm, MPI_Comm col_comm, MPI_Comm dup_comm,
+    MPI_Comm row_comm, MPI_Comm col_comm, 
     double *p2p_t, double *dgemm_t
 )
 {
@@ -186,7 +184,7 @@ int main(int argc, char **argv)
     MPI_Cart_sub(cart_comm, remain_k,  &dup_comm);
     MPI_Cart_sub(cart_comm, remain_ij, &plane_comm);
     
-    duplicate_comms(row_comm, col_comm, dup_comm, n_local, n_local);
+    duplicate_comms(dup_comm, n_local, n_local);
 
     int plane;
     MPI_Comm_rank(dup_comm, &plane);
@@ -235,39 +233,42 @@ int main(int argc, char **argv)
         
         st0 = MPI_Wtime();
         
-        // 1.1 Replicate A & B on each plane
+        // 1.1 Replicate A on each plane
         st1 = MPI_Wtime();
         for (int ii = 0; ii < N_DUP; ii++)
             MPI_Ibcast(A + spos[ii], blklen[ii], MPI_DOUBLE, 0, dup_comms[ii], &reqs[ii]);
-        for (int ii = 0; ii < N_DUP; ii++)
-        {
-            MPI_Wait(&reqs[ii], &status[ii]);  
-            memcpy(B + spos[ii], A + spos[ii], sizeof(double) * blklen[ii]);  // A == B
-        }
+        MPI_Waitall(N_DUP, &reqs[0], &status[0]);
+        //MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
         et1 = MPI_Wtime();
         bcast_t += et1 - st1;
         
-        // 1.2 Backup the broadcast A, save a broadcast in D := A * C
+        // 1.2 Copy B := A; backup the broadcast A to save a broadcast in D := A * C
+        memcpy(B, A, sizeof(double) * local_bs);
         memcpy(D0, A, sizeof(double) * local_bs);
 
         // 2. Do nproc_ij/c steps of Canon's algorithm to get C := A * B
         MM25D_Cannon_steps(
             i, j, k, nproc_ij, c, n_local, local_bs, A, B, A0, B0, 
-            C0, row_comm, col_comm, dup_comm, &p2p_t, &dgemm_t
+            C0, row_comm, col_comm, &p2p_t, &dgemm_t
         );
        
-        // 3 Reduce sum C to plane 0
+        // 3. Reduce sum C to plane 0
         st1 = MPI_Wtime();
         for (int ii = 0; ii < N_DUP; ii++)
             MPI_Ireduce(C0 + spos[ii], C + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, 0, dup_comms[ii], &reqs[ii]);
-        for (int ii = 0; ii < N_DUP; ii++)
-        {
-            MPI_Wait(&reqs[ii], &status[ii]);
-            MPI_Ibcast(C + spos[ii], blklen[ii], MPI_DOUBLE, 0, dup_comms[ii], &reqs[ii]);
-        }
         MPI_Waitall(N_DUP, &reqs[0], &status[0]);
+        //MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
         et1 = MPI_Wtime();
-        allreduce_t += et1 - st1;
+        reduce_t += et1 - st1;
+        
+        // 4.1 Replicate C on each plane
+        st1 = MPI_Wtime();
+        for (int ii = 0; ii < N_DUP; ii++)
+            MPI_Ibcast(C + spos[ii], blklen[ii], MPI_DOUBLE, 0, dup_comms[ii], &reqs[ii]);
+        MPI_Waitall(N_DUP, &reqs[0], &status[0]);
+        //MPI_Bcast(C, local_bs, MPI_DOUBLE, 0, dup_comm);
+        et1 = MPI_Wtime();
+        bcast_t += et1 - st1;
         
         // 4.2 Backup C and Recover A
         memcpy(C0, C, sizeof(double) * local_bs);
@@ -276,7 +277,7 @@ int main(int argc, char **argv)
         // 5. Do nproc_ij/c steps of Canon's algorithm
         MM25D_Cannon_steps(
             i, j, k, nproc_ij, c, n_local, local_bs, A, C0, A0, B0, 
-            D0, row_comm, col_comm, dup_comm, &p2p_t, &dgemm_t
+            D0, row_comm, col_comm, &p2p_t, &dgemm_t
         );
        
         // 6. Reduce sum C to processes on plane 0
@@ -284,6 +285,7 @@ int main(int argc, char **argv)
         for (int ii = 0; ii < N_DUP; ii++)
             MPI_Ireduce(D0 + spos[ii], D + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, 0, dup_comms[ii], &reqs[ii]);
         MPI_Waitall(N_DUP, &reqs[0], &status[0]);
+        //MPI_Reduce(D0, D, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
         et1 = MPI_Wtime();
         reduce_t += et1 - st1;
         
@@ -306,33 +308,25 @@ int main(int argc, char **argv)
     
     if (my_plane == 0) 
     {
-        double avg_p2p_t, avg_bcast_t, avg_reduce_t, avg_allreduce_t, avg_dgemm_t, avg_total_t, avg_comm_t, nproj_ij2;
-        MPI_Reduce(&p2p_t,       &avg_p2p_t,       1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&bcast_t,     &avg_bcast_t,     1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&allreduce_t, &avg_allreduce_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&reduce_t,    &avg_reduce_t,    1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&dgemm_t,     &avg_dgemm_t,     1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&total_t,     &avg_total_t,     1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
+        double max_p2p_t, max_bcast_t, max_reduce_t, max_dgemm_t, max_total_t, max_comm_t, nproj_ij2;
+        MPI_Reduce(&p2p_t,       &max_p2p_t,       1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
+        MPI_Reduce(&bcast_t,     &max_bcast_t,     1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
+        MPI_Reduce(&reduce_t,    &max_reduce_t,    1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
+        MPI_Reduce(&dgemm_t,     &max_dgemm_t,     1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
+        MPI_Reduce(&total_t,     &max_total_t,     1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
         nproj_ij2 = (double) (nproc_ij * nproc_ij);
-        avg_p2p_t       /= nproj_ij2;
-        avg_bcast_t     /= nproj_ij2;
-        avg_allreduce_t /= nproj_ij2;
-        avg_reduce_t    /= nproj_ij2;
-        avg_dgemm_t     /= nproj_ij2;
-        avg_total_t     /= nproj_ij2;
-        avg_comm_t = avg_p2p_t + avg_bcast_t + avg_allreduce_t + avg_reduce_t;
+        max_comm_t = max_p2p_t + max_bcast_t + max_reduce_t;
         
         if (my_rank == root) 
         {
-            printf("PDGEMM 2.5D algorithm %d runs average timing:\n", ntest);
+            printf("PDGEMM 2.5D algorithm %d runs max timing:\n", ntest);
             printf("  Communication time:\n");
-            printf("    * P2P        : %.2lf (s)\n", avg_p2p_t);
-            printf("    * Bcast      : %.2lf (s)\n", avg_bcast_t);
-            printf("    * Allreduce  : %.2lf (s)\n", avg_allreduce_t);
-            printf("    * Reduce     : %.2lf (s)\n", avg_reduce_t);
-            printf("    * Total      : %.2lf (s)\n", avg_comm_t);
-            printf("  Local DGEMM = %.2lf (s), %.2lf GFlops\n", avg_dgemm_t, GFlop / avg_dgemm_t);
-            printf("  Overall = %.2lf (s), %.2lf GFlops\n", avg_total_t, GFlop / avg_total_t);
+            printf("    * P2P        : %.2lf (s)\n", max_p2p_t);
+            printf("    * Bcast      : %.2lf (s)\n", max_bcast_t);
+            printf("    * Reduce     : %.2lf (s)\n", max_reduce_t);
+            printf("    * Total      : %.2lf (s)\n", max_comm_t);
+            printf("  Local DGEMM = %.2lf (s), %.2lf GFlops\n", max_dgemm_t, GFlop / max_dgemm_t);
+            printf("  Overall = %.2lf (s), %.2lf GFlops\n", max_total_t, GFlop / max_total_t);
         }
     }
     
