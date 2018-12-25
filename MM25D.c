@@ -10,6 +10,92 @@
 
 #include "utils.c"
 
+void MM25D_Cannon_steps(
+    int i, int j, int k, int nproc_ij, int c, 
+    int n_local, int local_bs,
+    double *A, double *B, double *A0, double *B0, double *C,
+    MPI_Comm row_comm, MPI_Comm col_comm, 
+    double *p2p_t, double *dgemm_t
+)
+{
+    MPI_Status status;
+    double st1, et1;
+    
+    double *sendA, *recvA, *sendB, *recvB, *tmpptr;
+    MPI_Status sta0, sta1;
+    MPI_Request req0, req1, req2;
+    
+    sendA = A;  recvA = A0;
+    sendB = B;  recvB = B0;
+    
+    // (1) Initial circular shift on A and B
+    st1 = MPI_Wtime();
+    int shift = k * (nproc_ij / c);
+    int dstA = (j - i + shift + c * nproc_ij) % nproc_ij;
+    int dstB = (i - j + shift + c * nproc_ij) % nproc_ij;
+    MPI_Isend(sendA, local_bs, MPI_DOUBLE, dstA, 0, row_comm, &req2);
+    MPI_Isend(sendB, local_bs, MPI_DOUBLE, dstB, 1, col_comm, &req2);
+    MPI_Irecv(recvA, local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 0, row_comm, &req0);
+    MPI_Irecv(recvB, local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 1, col_comm, &req1);
+    MPI_Wait(&req0, &sta0);
+    MPI_Wait(&req1, &sta1); 
+    
+    et1 = MPI_Wtime();
+    p2p_t[0] += et1 - st1;
+    
+    // (2) Initial local DGEMM
+    st1 = MPI_Wtime();
+    cblas_dgemm(
+        CblasRowMajor, CblasNoTrans, CblasNoTrans,
+        n_local, n_local, n_local,
+        1, recvA, n_local, recvB, n_local, 0, C, n_local
+    );
+    et1 = MPI_Wtime();
+    dgemm_t[0] += et1 - st1;
+
+    tmpptr = sendA; sendA = recvA; recvA = tmpptr;
+    tmpptr = sendB; sendB = recvB; recvB = tmpptr;
+    
+    // (3) Do nproc_ij / c - 1 steps of Cannon's algorithm
+    int j_dst = (j + 1) % nproc_ij;
+    int i_dst = (i + 1) % nproc_ij; 
+    int j_src = (j - 1 + nproc_ij) % nproc_ij;
+    int i_src = (i - 1 + nproc_ij) % nproc_ij; 
+    for (int stage = 1; stage < nproc_ij / c; stage++) 
+    {
+        int datatag = stage + 1;
+        
+        st1 = MPI_Wtime();
+        
+        // Send A block to the right and receive a new from the left
+        MPI_Isend(sendA, local_bs, MPI_DOUBLE, j_dst, datatag, row_comm, &req2);
+        MPI_Irecv(recvA, local_bs, MPI_DOUBLE, j_src, datatag, row_comm, &req0);
+
+        // Send B block to the below and receive a new from the up
+        MPI_Isend(sendB, local_bs, MPI_DOUBLE, i_dst, datatag, col_comm, &req2);
+        MPI_Irecv(recvB, local_bs, MPI_DOUBLE, i_src, datatag, col_comm, &req1);
+        
+        MPI_Wait(&req0, &sta0);
+        MPI_Wait(&req1, &sta1);
+        
+        et1 = MPI_Wtime();
+        p2p_t[0] += et1 - st1;
+        
+        // Local DGEMM
+        st1 = MPI_Wtime();
+        cblas_dgemm(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            n_local, n_local, n_local,
+            1, recvA, n_local, recvB, n_local, 1, C, n_local
+        );
+        et1 = MPI_Wtime();
+        dgemm_t[0] += et1 - st1;
+        
+        tmpptr = sendA; sendA = recvA; recvA = tmpptr;
+        tmpptr = sendB; sendB = recvB; recvB = tmpptr;
+    }
+}
+
 int main(int argc, char **argv) 
 {
     int root = 0;
@@ -91,7 +177,7 @@ int main(int argc, char **argv)
     MPI_Barrier(cart_comm);
     
     double st0, et0, st1, et1;
-    double comm_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
+    double p2p_t = 0.0, bcast_t = 0.0, reduce_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
     double *sendA, *recvA, *sendB, *recvB, *tmpptr;
     
@@ -105,83 +191,20 @@ int main(int argc, char **argv)
         st1 = MPI_Wtime();
         MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
         MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
-        
-        // 2. Initial circular shift on A and B
-        int dst, src, shift, datatag;
-        MPI_Status sta0, sta1;
-        MPI_Request req0, req1, req2;
-        sendA = A;  recvA = A0;
-        sendB = B;  recvB = B0;
-        shift = k * (nproc_ij / c);
-        int dstA = (j - i + shift + c * nproc_ij) % nproc_ij;
-        int dstB = (i - j + shift + c * nproc_ij) % nproc_ij;
-        MPI_Isend(sendA, local_bs, MPI_DOUBLE, dstA, 0, row_comm, &req2);
-        MPI_Isend(sendB, local_bs, MPI_DOUBLE, dstB, 1, col_comm, &req2);
-        MPI_Irecv(recvA, local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 0, row_comm, &req0);
-        MPI_Irecv(recvB, local_bs, MPI_DOUBLE, MPI_ANY_SOURCE, 1, col_comm, &req1);
-        MPI_Wait(&req0, &sta0);
-        MPI_Wait(&req1, &sta1);
-        
         et1 = MPI_Wtime();
-        comm_t += et1 - st1;
+        bcast_t += et1 - st1;
         
-        // 3. Initial local DGEMM
-        st1 = MPI_Wtime();
-        cblas_dgemm(
-            CblasRowMajor, CblasNoTrans, CblasNoTrans,
-            n_local, n_local, n_local,
-            1, recvA, n_local, recvB, n_local, 0, C0, n_local
+        // 2. nproc_ij/c steps of Cannon's Algorithm
+        MM25D_Cannon_steps(
+            i, j, k, nproc_ij, c, n_local, local_bs, A, B, 
+            A0, B0, C0, row_comm, col_comm, &p2p_t, &dgemm_t
         );
-        et1 = MPI_Wtime();
-        dgemm_t += et1 - st1;
-        
-        tmpptr = sendA; sendA = recvA; recvA = tmpptr;
-        tmpptr = sendB; sendB = recvB; recvB = tmpptr;
-
-        // 4. Do nproc_ij / c steps of Cannon's algorithm
-        int j_dst = (j + 1) % nproc_ij;
-        int i_dst = (i + 1) % nproc_ij; 
-        int j_src = (j - 1 + nproc_ij) % nproc_ij;
-        int i_src = (i - 1 + nproc_ij) % nproc_ij; 
-        for (int stage = 1; stage < nproc_ij / c; stage++) 
-        {
-            datatag = stage + 1;
-            
-            st1 = MPI_Wtime();
-            
-            // (1) Send A block to the right and receive a new from the left
-            MPI_Isend(sendA, local_bs, MPI_DOUBLE, j_dst, datatag, row_comm, &req2);
-            MPI_Irecv(recvA, local_bs, MPI_DOUBLE, j_src, datatag, row_comm, &req0);
-
-            // (2) Send B block to the below and receive a new from the up
-            MPI_Isend(sendB, local_bs, MPI_DOUBLE, i_dst, datatag, col_comm, &req2);
-            MPI_Irecv(recvB, local_bs, MPI_DOUBLE, i_src, datatag, col_comm, &req1);
-            
-            MPI_Wait(&req0, &sta0);
-            MPI_Wait(&req1, &sta1);
-            
-            et1 = MPI_Wtime();
-            comm_t += et1 - st1;
-            
-            // (3) Local DGEMM
-            st1 = MPI_Wtime();
-            cblas_dgemm(
-                CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                n_local, n_local, n_local,
-                1, recvA, n_local, recvB, n_local, 1, C0, n_local
-            );
-            et1 = MPI_Wtime();
-            dgemm_t += et1 - st1;
-            
-            tmpptr = sendA; sendA = recvA; recvA = tmpptr;
-            tmpptr = sendB; sendB = recvB; recvB = tmpptr;
-        }
 
         // 5. Reduce sum the result to processes on plane 0
         st1 = MPI_Wtime();
         MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
         et1 = MPI_Wtime();
-        comm_t += et1 - st1;
+        reduce_t += et1 - st1;
         
         et0 = MPI_Wtime();
         total_t += et0 - st0;
@@ -200,23 +223,24 @@ int main(int argc, char **argv)
     
     double GFlop = 2.0 * (double) n * (double) n * (double) n * (double) ntest / 1000000000.0;
     
-    double avg_comm_t, avg_dgemm_t, avg_total_t;
+    double max_p2p_t, max_bcast_t, max_reduce_t, max_dgemm_t, max_total_t;
     
     if (my_plane == 0) 
     {
-        MPI_Reduce(&comm_t,  &avg_comm_t,  1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&dgemm_t, &avg_dgemm_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        MPI_Reduce(&total_t, &avg_total_t, 1, MPI_DOUBLE, MPI_SUM, root, plane_comm);
-        avg_comm_t  /= (double) (nproc_ij * nproc_ij);
-        avg_dgemm_t /= (double) (nproc_ij * nproc_ij);
-        avg_total_t /= (double) (nproc_ij * nproc_ij);
+        MPI_Reduce(&p2p_t,    &max_p2p_t,    1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
+        MPI_Reduce(&bcast_t,  &max_bcast_t,  1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
+        MPI_Reduce(&reduce_t, &max_reduce_t, 1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
+        MPI_Reduce(&dgemm_t,  &max_dgemm_t,  1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
+        MPI_Reduce(&total_t,  &max_total_t,  1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
         
         if (my_rank == root) 
         {
-            printf("PDGEMM 2.5D algorithm %d runs average timing:\n", ntest);
-            printf("  * Communication = %.2lf (s)\n", avg_comm_t);
-            printf("  * Local DGEMM   = %.2lf (s), %.2lf GFlops\n", avg_dgemm_t, GFlop / avg_dgemm_t);
-            printf("  * Overall       = %.2lf (s), %.2lf GFlops\n", avg_total_t, GFlop / avg_total_t);
+            printf("PDGEMM 2.5D algorithm %d runs max timing:\n", ntest);
+            printf("  * Isend & Irecv = %.2lf (s)\n", max_p2p_t);
+            printf("  * Broadcast     = %.2lf (s)\n", bcast_t);
+            printf("  * Reduce        = %.2lf (s)\n", reduce_t);
+            printf("  * Local DGEMM   = %.2lf (s), %.2lf GFlops\n", max_dgemm_t, GFlop / max_dgemm_t);
+            printf("  * Overall       = %.2lf (s), %.2lf GFlops\n", max_total_t, GFlop / max_total_t);
         }
     }
     
