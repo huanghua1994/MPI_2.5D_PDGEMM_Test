@@ -11,6 +11,38 @@
 
 #include "utils.c"
 
+#define N_DUP    4
+MPI_Comm    dup_comms[N_DUP];
+MPI_Status  status[N_DUP];
+MPI_Request reqs[N_DUP], reqs0[N_DUP];
+int spos[N_DUP + 1], blklen[N_DUP];
+int row_spos[N_DUP + 1], row_blklen[N_DUP];
+
+void duplicate_comms(MPI_Comm dup_comm, int nrow, int ncol)
+{    
+    int remainder  = nrow % N_DUP;
+    int block_size = nrow / N_DUP;
+    for (int i = 0; i < remainder; i++)
+    {
+        row_blklen[i] = block_size + 1;
+        blklen[i] = row_blklen[i] * ncol;
+    }
+    for (int i = remainder; i < N_DUP; i++)
+    {
+        row_blklen[i] = block_size;
+        blklen[i] = row_blklen[i] * ncol;
+    }
+    
+    row_spos[0] = spos[0] = 0;
+    for (int i = 0; i < N_DUP; i++)
+    {
+        MPI_Comm_dup(dup_comm, &dup_comms[i]);
+        spos[i + 1] = spos[i] + blklen[i];
+        row_spos[i + 1] = row_spos[i] + row_blklen[i];
+    }
+}
+
+
 void MM25D_Cannon_steps(
     int i, int j, int k, int nproc_ij, int c, 
     int n_local, int local_bs,
@@ -100,7 +132,6 @@ void MM25D_Cannon_steps(
 int main(int argc, char **argv) 
 {
     int root = 0;
-    MPI_Status status; 
 
     // Disable memory mapped malloc for caching page registrations 
     mallopt(M_MMAP_MAX, 0);
@@ -152,6 +183,8 @@ int main(int argc, char **argv)
     MPI_Cart_sub(cart_comm, remain_i,  &col_comm);
     MPI_Cart_sub(cart_comm, remain_k,  &dup_comm);
     MPI_Cart_sub(cart_comm, remain_ij, &plane_comm);
+    
+    duplicate_comms(dup_comm, n_local, n_local);
 
     int plane;
     MPI_Comm_rank(dup_comm, &plane);
@@ -194,8 +227,16 @@ int main(int argc, char **argv)
         
         // 1. Replicate input matrix on each plane
         st1 = MPI_Wtime();
-        MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
-        MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
+        for (int ii = 0; ii < N_DUP; ii++)
+            MPI_Ibcast(A + spos[ii], blklen[ii], MPI_DOUBLE, 0, dup_comms[ii], &reqs[ii]);
+        for (int ii = 0; ii < N_DUP; ii++)
+        {
+            MPI_Wait(&reqs[ii], &status[ii]);
+            MPI_Ibcast(B + spos[ii], blklen[ii], MPI_DOUBLE, 0, dup_comms[ii], &reqs[ii]);
+        }
+        MPI_Waitall(N_DUP, &reqs[0], &status[0]);
+        //MPI_Bcast(A, local_bs, MPI_DOUBLE, 0, dup_comm);
+        //MPI_Bcast(B, local_bs, MPI_DOUBLE, 0, dup_comm);
         et1 = MPI_Wtime();
         bcast_t += et1 - st1;
         
@@ -207,7 +248,10 @@ int main(int argc, char **argv)
 
         // 5. Reduce sum the result to processes on plane 0
         st1 = MPI_Wtime();
-        MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
+        for (int ii = 0; ii < N_DUP; ii++)
+            MPI_Ireduce(C0 + spos[ii], C + spos[ii], blklen[ii], MPI_DOUBLE, MPI_SUM, 0, dup_comms[ii], &reqs[ii]);
+        MPI_Waitall(N_DUP, &reqs[0], &status[0]);
+        //MPI_Reduce(C0, C, local_bs, MPI_DOUBLE, MPI_SUM, 0, dup_comm);
         et1 = MPI_Wtime();
         reduce_t += et1 - st1;
         
