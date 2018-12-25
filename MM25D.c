@@ -3,10 +3,11 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include "mpi.h"
-#include "mkl.h"
+#include <malloc.h>
+#include <mpi.h>
+#include <mkl.h>
 
-#define VERIFY
+//#define VERIFY
 
 #include "utils.c"
 
@@ -101,6 +102,10 @@ int main(int argc, char **argv)
     int root = 0;
     MPI_Status status; 
 
+    // Disable memory mapped malloc for caching page registrations 
+    mallopt(M_MMAP_MAX, 0);
+    mallopt(M_TRIM_THRESHOLD, -1);
+    
     MPI_Init(&argc, &argv);
     
     int my_rank, nproc, c, nproc_ij;
