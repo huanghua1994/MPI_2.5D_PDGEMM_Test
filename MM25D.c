@@ -14,7 +14,7 @@
 #define N_DUP    4
 MPI_Comm    dup_comms[N_DUP];
 MPI_Status  status[N_DUP];
-MPI_Request reqs[N_DUP], reqs0[N_DUP];
+MPI_Request reqs[N_DUP];
 int spos[N_DUP + 1], blklen[N_DUP];
 int row_spos[N_DUP + 1], row_blklen[N_DUP];
 
@@ -50,7 +50,6 @@ void MM25D_Cannon_steps(
     double *p2p_t, double *dgemm_t
 )
 {
-    MPI_Status status;
     double st1, et1;
     
     double *sendA, *recvA, *sendB, *recvB, *tmpptr;
@@ -216,6 +215,16 @@ int main(int argc, char **argv)
     );
     MPI_Barrier(cart_comm);
     
+    #ifndef VERIFY
+    if (my_rank == 0)
+    {
+        mkl_free(M);
+        mkl_free(N);
+        mkl_free(P);
+        mkl_free(Q);
+    }
+    #endif
+    
     double st0, et0, st1, et1;
     double p2p_t = 0.0, bcast_t = 0.0, reduce_t = 0.0, allreduce_t = 0.0, dgemm_t = 0.0, total_t = 0.0;
     
@@ -293,6 +302,7 @@ int main(int argc, char **argv)
         total_t += et0 - st0;
         
         #ifdef VERIFY
+        MPI_Barrier(MPI_COMM_WORLD);
         if (itest == 0)
         {
             gather_result(
@@ -308,25 +318,22 @@ int main(int argc, char **argv)
     
     if (my_plane == 0) 
     {
-        double max_p2p_t, max_bcast_t, max_reduce_t, max_dgemm_t, max_total_t, max_comm_t, nproj_ij2;
+        double max_p2p_t, max_bcast_t, max_reduce_t, max_dgemm_t, max_total_t;
         MPI_Reduce(&p2p_t,       &max_p2p_t,       1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
         MPI_Reduce(&bcast_t,     &max_bcast_t,     1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
         MPI_Reduce(&reduce_t,    &max_reduce_t,    1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
         MPI_Reduce(&dgemm_t,     &max_dgemm_t,     1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
         MPI_Reduce(&total_t,     &max_total_t,     1, MPI_DOUBLE, MPI_MAX, root, plane_comm);
-        nproj_ij2 = (double) (nproc_ij * nproc_ij);
-        max_comm_t = max_p2p_t + max_bcast_t + max_reduce_t;
         
         if (my_rank == root) 
         {
             printf("PDGEMM 2.5D algorithm %d runs max timing:\n", ntest);
             printf("  Communication time:\n");
-            printf("    * P2P        : %.2lf (s)\n", max_p2p_t);
-            printf("    * Bcast      : %.2lf (s)\n", max_bcast_t);
-            printf("    * Reduce     : %.2lf (s)\n", max_reduce_t);
-            printf("    * Total      : %.2lf (s)\n", max_comm_t);
+            printf("    * P2P     = %.2lf (s)\n", max_p2p_t);
+            printf("    * Bcast   = %.2lf (s)\n", max_bcast_t);
+            printf("    * Reduce  = %.2lf (s)\n", max_reduce_t);
             printf("  Local DGEMM = %.2lf (s), %.2lf GFlops\n", max_dgemm_t, GFlop / max_dgemm_t);
-            printf("  Overall = %.2lf (s), %.2lf GFlops\n", max_total_t, GFlop / max_total_t);
+            printf("  Overall     = %.2lf (s), %.2lf GFlops\n", max_total_t, GFlop / max_total_t);
         }
     }
     
